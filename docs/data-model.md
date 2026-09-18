@@ -275,8 +275,13 @@ create table drift_signals (
   triggered  boolean not null
 );
 
--- Supabase: activar RLS y escribir solo desde el pipeline con la service key
--- (guardada como secret de GitHub, nunca en el navegador).
+-- Supabase: activar RLS en TODAS las tablas y escribir solo desde el pipeline con la
+-- service key (guardada como secret de GitHub, nunca en el navegador). Sin policies,
+-- `anon` no lee nada; si un dashboard va a leer los datos del reto directo desde el
+-- navegador, agregar una policy `for select` solo a stations/observations/context.
+alter table stations       enable row level security;
+alter table context        enable row level security;
+alter table observations   enable row level security;
 alter table pipeline_runs  enable row level security;
 alter table model_versions enable row level security;
 alter table model_metrics  enable row level security;
