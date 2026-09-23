@@ -1,0 +1,41 @@
+name: pulso-transmi-train
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Evaluar y decidir sin escribir en Supabase"
+        type: boolean
+        default: false
+  # Activar cuando haya al menos una promoción manual validada:
+  # schedule:
+  #   - cron: "17 6 * * *"
+
+concurrency:
+  group: pulso-transmi-train
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar paquetes (SDK + pipeline + modelo)
+        run: python -m pip install -e '.[pipeline]' -e ./modelo
+
+      - name: Entrenar, comparar y promover
+        env:
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python -m pulso_pipeline.train_and_promote ${{ inputs.dry_run && '--dry-run' || '' }}

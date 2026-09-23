@@ -1,3 +1,3 @@
-from pulso_transmi.client import PulsoTransmiClient, PulsoTransmiError
+from pulso_transmi.client import PulsoTransmiApiError, PulsoTransmiClient, PulsoTransmiError
 
-__all__ = ["PulsoTransmiClient", "PulsoTransmiError"]
+__all__ = ["PulsoTransmiApiError", "PulsoTransmiClient", "PulsoTransmiError"]

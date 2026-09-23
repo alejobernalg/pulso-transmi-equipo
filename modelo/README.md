@@ -1,7 +1,8 @@
 # pulso-forecast
 
 Modelo de pronóstico de demanda (cada 15 min, 12 estaciones) para el reto Pulso TransMi.
-Gradient boosting por horizonte (15 min, 1 h, 4 h, 24 h) sobre features **solo del pasado**.
+Gradient boosting por horizonte (+15, +30, +45, +60 min, el contrato oficial de cada
+ciclo) sobre features **solo del pasado**.
 
 ## Uso
 
@@ -21,10 +22,10 @@ para el último instante de `observations.csv`.
 
 | Horizonte | Accuracy | Baseline semanal |
 |---|---:|---:|
-| 15 min | 88,20 | 83,11 |
-| 1 h | 88,08 | 83,11 |
-| 4 h | 88,01 | 83,11 |
-| 24 h | 87,72 | 83,11 |
+| +15 min | 88,20 | 83,11 |
+| +30 min | 88,17 | 83,11 |
+| +45 min | 88,16 | 83,11 |
+| +60 min | 88,08 | 83,11 |
 
 ## Sin fuga de datos
 
@@ -34,6 +35,5 @@ y exige que las features no cambien (`pytest`).
 
 ## Limitaciones
 
-- Los horizontes definitivos del reto no están publicados; se cambian en `HORIZONS`.
 - Entrenado con 45 días: hay que reentrenar cuando lleguen datos nuevos (deriva leve al alza).
 - `model.joblib` requiere scikit-learn 1.x compatible con el usado al entrenar (ver `model_meta.json`).

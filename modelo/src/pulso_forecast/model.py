@@ -19,7 +19,7 @@ DATA = Path(os.environ.get("PULSO_DATA_DIR", "data"))  # carpeta con los CSV del
 TZ = "America/Bogota"
 STEP_MIN = 15
 DAY, WEEK = 96, 672
-HORIZONS = (1, 4, 16, 96)  # 15 min, 1 h, 4 h, 24 h (los definitivos no están publicados)
+HORIZONS = (1, 2, 3, 4)  # 15, 30, 45, 60 min: contrato oficial (guía operativa v2.0, 2026-09-21)
 LAGS = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 48, 96)
 SEASONAL = (96, 192, 672, 1344)
 EVENT_THRESHOLD = 0.1  # event_intensity trae denormales ~1e-323: hay que umbralizar
@@ -33,13 +33,30 @@ def load_data(data_dir: Path | str | None = None):
     obs = pd.read_csv(data_dir / "observations.csv", dtype={"station_id": str})
     ctx = pd.read_csv(data_dir / "context.csv")
     stations = pd.read_csv(data_dir / "stations.csv", dtype={"station_id": str})
+    return wide_from_frames(obs, ctx, stations)
+
+
+def wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame):
+    """Construye (y, ctx, stations) en formato ancho a partir de DataFrames ya
+    cargados (de CSV o de Supabase).
+
+    `context` puede ir más atrás que `observations` (en el pipeline en vivo,
+    `/v1/stream/observations` libera periodos nuevos antes de que
+    `/v1/context` los tenga): se rellena con NaN, que el modelo ya maneja de
+    forma nativa. Lo que sí es un error real es que `context` tenga periodos
+    que `observations` no tiene (huérfanos).
+    """
+    obs = obs.copy()
+    ctx = ctx.copy()
     for frame in (obs, ctx):
         frame["observed_at"] = pd.to_datetime(frame["observed_at"], utc=True)
     y = obs.pivot(index="observed_at", columns="station_id", values="demand").sort_index().astype(float)
     ctx = ctx.set_index("observed_at").sort_index()
     steps = y.index.to_series().diff().dropna().unique()
     assert len(steps) == 1 and steps[0] == pd.Timedelta(minutes=STEP_MIN), "la serie debe ser regular"
-    assert ctx.index.equals(y.index), "context debe cubrir los mismos periodos"
+    orphan_ctx = ctx.index.difference(y.index)
+    assert orphan_ctx.empty, f"context tiene {len(orphan_ctx)} periodos sin observaciones"
+    ctx = ctx.reindex(y.index)
     stations = stations.set_index("station_id").loc[y.columns]
     return y, ctx, stations
 
@@ -165,6 +182,11 @@ GRID = [
 
 def run(out_dir: Path, horizons=HORIZONS, test_days: int = 7, data_dir=None) -> dict:
     y, ctx, stations = load_data(data_dir)
+    return run_from_frames(y, ctx, stations, out_dir, horizons=horizons, test_days=test_days)
+
+
+def run_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, out_dir: Path,
+                     horizons=HORIZONS, test_days: int = 7) -> dict:
     n_t = len(y)
     test_start = n_t - test_days * DAY
     folds = [(test_start - 2 * WEEK, test_start - WEEK), (test_start - WEEK, test_start)]
@@ -210,8 +232,14 @@ def run(out_dir: Path, horizons=HORIZONS, test_days: int = 7, data_dir=None) -> 
 
 def train_production(out_dir: Path, params_by_h: dict[int, dict], horizons=HORIZONS, data_dir=None):
     """Reentrena con TODOS los datos disponibles y guarda un modelo por horizonte."""
-    import joblib
     y, ctx, stations = load_data(data_dir)
+    return train_production_from_frames(y, ctx, stations, out_dir, params_by_h, horizons=horizons)
+
+
+def train_production_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, out_dir: Path,
+                                  params_by_h: dict[int, dict], horizons=HORIZONS) -> dict:
+    """Igual que `train_production` pero a partir de frames ya cargados (p. ej. desde Supabase)."""
+    import joblib
     n_t = len(y)
     models = {}
     for h in horizons:
@@ -247,4 +275,50 @@ def forecast_next(models: dict, horizons=None, data_dir=None) -> pd.DataFrame:
         for st, p in zip(stations.index[cur["station"].astype(int)], pred):
             rows.append({"station_id": st, "origin_at": origin, "horizon_steps": h,
                          "target_at": origin + pd.Timedelta(minutes=STEP_MIN * h), "value": round(float(p), 2)})
+    return pd.DataFrame(rows)
+
+
+def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
+                          origin, targets) -> pd.DataFrame:
+    """Predice exactamente los pares (station_id, target_at) que pide un ciclo.
+
+    `origin` es el `data_cutoff` del ciclo (debe ser el último índice de `y`).
+    `targets` es una lista de (station_id, target_at); el horizonte de cada
+    fila se deriva de `target_at - origin` y debe caer en `models`. Devuelve
+    las filas en el mismo orden que `targets`.
+    """
+    origin = pd.Timestamp(origin)
+    if origin.tzinfo is None:
+        origin = origin.tz_localize("UTC")
+    if y.index[-1] != origin:
+        raise ValueError(f"origin {origin} no coincide con el último dato disponible {y.index[-1]}")
+
+    parsed = []
+    for station_id, target_at in targets:
+        target_at = pd.Timestamp(target_at)
+        if target_at.tzinfo is None:
+            target_at = target_at.tz_localize("UTC")
+        delta_steps = (target_at - origin) / pd.Timedelta(minutes=STEP_MIN)
+        h = round(delta_steps)
+        if abs(delta_steps - h) > 1e-6 or h not in models:
+            raise ValueError(f"target_at {target_at} no cae en un horizonte soportado ({sorted(models)} pasos)")
+        parsed.append((station_id, target_at, h))
+
+    by_h = pd.Series([h for _, _, h in parsed]).unique()
+    preds_by_h: dict[int, pd.Series] = {}
+    for h in by_h:
+        ext_idx = y.index.append(pd.date_range(origin + pd.Timedelta(minutes=STEP_MIN), periods=h,
+                                               freq=f"{STEP_MIN}min"))
+        frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, h)
+        cur = frame[frame["_t"] == len(y) - 1]
+        pred = predict(models[h], cur)
+        station_ids = stations.index[cur["station"].astype(int)]
+        preds_by_h[h] = pd.Series(pred, index=station_ids)
+
+    rows = []
+    for station_id, target_at, h in parsed:
+        if station_id not in preds_by_h[h].index:
+            raise ValueError(f"estación desconocida en el modelo: {station_id}")
+        rows.append({"station_id": station_id, "target_at": target_at, "horizon_steps": h,
+                     "value": round(float(preds_by_h[h][station_id]), 2)})
     return pd.DataFrame(rows)

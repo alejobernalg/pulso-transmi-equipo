@@ -14,8 +14,10 @@ erDiagram
     PIPELINE_RUNS ||--o{ PREDICTIONS : "genera"
     PIPELINE_RUNS ||--o{ MODEL_METRICS : "mide"
     PIPELINE_RUNS ||--o{ DRIFT_SIGNALS : "detecta"
+    PIPELINE_RUNS ||--o{ SUBMISSION_RECEIPTS : "registra"
     MODEL_VERSIONS ||--o{ PREDICTIONS : "produce"
     MODEL_VERSIONS ||--o{ MODEL_METRICS : "evaluado en"
+    MODEL_VERSIONS ||--o{ SUBMISSION_RECEIPTS : "entrega con"
     MODEL_VERSIONS |o--o| MODEL_VERSIONS : "reemplaza a"
     STATIONS ||--o{ PREDICTIONS : "para"
     STATIONS ||--o{ MODEL_METRICS : "por estación"
@@ -103,6 +105,24 @@ erDiagram
         float threshold
         bool triggered
     }
+    SYNC_STATE {
+        text resource PK "observations_stream, context"
+        text cursor "cursor opaco de la API"
+        timestamptz updated_at
+    }
+    SUBMISSION_RECEIPTS {
+        bigint receipt_id PK
+        uuid run_id FK
+        text cycle_id
+        uuid model_id FK
+        smallint attempt
+        text idempotency_key
+        text predictions_hash
+        smallint http_status
+        text submission_id "de la API"
+        text status
+        timestamptz accepted_at
+    }
 ```
 
 Las tablas de datos del reto se mantienen tal cual las entrega la API. El
@@ -161,6 +181,13 @@ Observaciones de diseño:
   `station_id NULL` es la métrica agregada.
 - **`drift_signals`** guarda tanto la señal como el umbral, así la decisión de
   reentrenar se puede auditar después.
+- **`sync_state`** (añadida 2026-09-22) es el cursor persistente que exige la guía
+  operativa v2.0: una fila por recurso (`observations_stream`, `context`), y solo
+  avanza después de un `upsert` confirmado, nunca antes.
+- **`submission_receipts`** (añadida 2026-09-22) es la guarda anti-duplicados: única
+  por `(cycle_id, model_id)`. Antes de inferir, el pipeline consulta esta tabla; si ya
+  existe una fila, no vuelve a llamar `POST /v1/submissions` aunque el cron despierte
+  de nuevo dentro de la misma ventana de 25 minutos.
 
 ### Cosas que dejé abiertas (no las sé)
 
@@ -275,16 +302,48 @@ create table drift_signals (
   triggered  boolean not null
 );
 
+-- Estado del pipeline (añadido 2026-09-22) -----------------------------------
+create table sync_state (
+  resource   text primary key,        -- 'observations_stream' | 'context'
+  cursor     text,
+  updated_at timestamptz not null default now()
+);
+
+create table submission_receipts (
+  receipt_id        bigint generated always as identity primary key,
+  run_id            uuid references pipeline_runs(run_id),
+  cycle_id          text not null,
+  model_id          uuid not null references model_versions(model_id),
+  attempt           smallint not null default 1,
+  idempotency_key   text not null,
+  predictions_hash  text not null,
+  http_status       smallint,
+  submission_id     text,
+  status            text,
+  accepted_at       timestamptz,
+  created_at        timestamptz not null default now(),
+  unique (cycle_id, model_id)
+);
+
+alter table predictions add column cycle_id text;
+
+-- Bucket de Storage para el artefacto del champion (inmutable, una carpeta por versión)
+insert into storage.buckets (id, name, public)
+values ('models', 'models', false)
+on conflict (id) do nothing;
+
 -- Supabase: activar RLS en TODAS las tablas y escribir solo desde el pipeline con la
 -- service key (guardada como secret de GitHub, nunca en el navegador). Sin policies,
 -- `anon` no lee nada; si un dashboard va a leer los datos del reto directo desde el
 -- navegador, agregar una policy `for select` solo a stations/observations/context.
-alter table stations       enable row level security;
-alter table context        enable row level security;
-alter table observations   enable row level security;
-alter table pipeline_runs  enable row level security;
-alter table model_versions enable row level security;
-alter table model_metrics  enable row level security;
-alter table predictions    enable row level security;
-alter table drift_signals  enable row level security;
+alter table stations             enable row level security;
+alter table context              enable row level security;
+alter table observations         enable row level security;
+alter table pipeline_runs        enable row level security;
+alter table model_versions       enable row level security;
+alter table model_metrics        enable row level security;
+alter table predictions          enable row level security;
+alter table drift_signals        enable row level security;
+alter table sync_state           enable row level security;
+alter table submission_receipts  enable row level security;
 ```

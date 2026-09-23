@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 ml = ["scikit-learn>=1.5,<2"]
 dev = ["pytest>=8,<9"]
+pipeline = ["supabase>=2,<3", "joblib>=1.4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

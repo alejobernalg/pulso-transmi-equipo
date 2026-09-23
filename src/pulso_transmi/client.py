@@ -12,6 +12,15 @@ import pandas as pd
 DEFAULT_BASE_URL = "https://pulso-transmi.72-60-245-2.sslip.io"
 
 
+class PulsoTransmiApiError(RuntimeError):
+    """POST/GET de competencia rechazado por la API (4xx/5xx con detalle)."""
+
+    def __init__(self, status_code: int, detail: Any) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"HTTP {status_code}: {detail}")
+
+
 class PulsoTransmiError(RuntimeError):
     """Raised when the Pulso TransMi API cannot fulfill a request."""
 
@@ -56,6 +65,63 @@ class PulsoTransmiClient:
 
     def meta(self) -> dict[str, Any]:
         return self._get("/v1/meta").json()
+
+    def me(self) -> dict[str, Any]:
+        return self._get("/v1/me").json()
+
+    def clock(self) -> dict[str, Any]:
+        return self._get("/v1/clock").json()
+
+    def current_cycle(self) -> dict[str, Any] | None:
+        """Devuelve el ciclo abierto, o None si la API responde 404 no_open_cycle."""
+        try:
+            return self._get("/v1/forecast-cycles/current").json()
+        except PulsoTransmiError as exc:
+            if isinstance(exc.__cause__, httpx.HTTPStatusError) and exc.__cause__.response.status_code == 404:
+                return None
+            raise
+
+    def stream_observations_page(
+        self, *, cursor: str | None = None, limit: int = 1000
+    ) -> dict[str, Any]:
+        params = {"cursor": cursor, "limit": limit}
+        return self._get(
+            "/v1/stream/observations", params={key: value for key, value in params.items() if value is not None}
+        ).json()
+
+    def submission_receipt(self, submission_id: str) -> dict[str, Any]:
+        return self._get(f"/v1/submissions/{submission_id}").json()
+
+    def submit(
+        self,
+        *,
+        cycle_id: str,
+        client_run_id: str,
+        data_cutoff: str,
+        model: dict[str, Any],
+        predictions: list[dict[str, Any]],
+        idempotency_key: str,
+        schema_version: str = "1.0",
+    ) -> dict[str, Any]:
+        """POST /v1/submissions. No reintenta: el llamador decide según el código."""
+        body = {
+            "schema_version": schema_version,
+            "cycle_id": cycle_id,
+            "client_run_id": client_run_id,
+            "data_cutoff": data_cutoff,
+            "model": model,
+            "predictions": predictions,
+        }
+        response = self._client.post(
+            "/v1/submissions", json=body, headers={"Idempotency-Key": idempotency_key}
+        )
+        if response.status_code in (200, 201):
+            return response.json()
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise PulsoTransmiApiError(response.status_code, detail)
 
     def stations(self) -> pd.DataFrame:
         payload = self._get("/v1/stations").json()
