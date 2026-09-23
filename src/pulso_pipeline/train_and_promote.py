@@ -84,11 +84,12 @@ def champion_baseline_accuracy(database, model_id: str) -> float | None:
 
 def check_drift(database, active_model_id: str, baseline_accuracy: float | None, run_id: str) -> None:
     """Compara accuracy reciente (predicciones ya entregadas y ya observadas)
-    contra la accuracy de validación del champion. Heurística simple (no PSI
-    multivariado): un chequeo honesto de degradación, no un detector completo.
+    contra la accuracy de validación del champion, y deja evidencia en
+    `model_metrics` (split='live') aunque no dispare drift. Heurística simple
+    (no PSI multivariado): un chequeo honesto de degradación, no un detector
+    completo. La cobertura aquí es local (sobre las últimas 500 predicciones
+    de este modelo), no la oficial de la plataforma (`/v1/leaderboard`).
     """
-    if baseline_accuracy is None:
-        return
     preds = (
         database.table("predictions")
         .select("station_id,target_at,y_pred")
@@ -98,7 +99,7 @@ def check_drift(database, active_model_id: str, baseline_accuracy: float | None,
         .execute()
         .data
     )
-    if len(preds) < DRIFT_MIN_SAMPLES:
+    if not preds:
         return
     targets = sorted({p["target_at"] for p in preds})
     obs_rows = (
@@ -111,24 +112,42 @@ def check_drift(database, active_model_id: str, baseline_accuracy: float | None,
     actual = {(r["station_id"], r["observed_at"]): r["demand"] for r in obs_rows}
     matched = [(p["y_pred"], actual[(p["station_id"], p["target_at"])])
                for p in preds if (p["station_id"], p["target_at"]) in actual]
-    if len(matched) < DRIFT_MIN_SAMPLES:
-        return
-    err = sum(abs(y - p) for p, y in matched)
-    tot = sum(y for _, y in matched)
-    recent_accuracy = 100 * max(0.0, 1 - err / tot) if tot else 0.0
-    drop = baseline_accuracy - recent_accuracy
-    db.save_drift_signals(database, [{
-        "run_id": run_id,
-        "station_id": None,
-        "kind": "concept",
-        "feature": "accuracy",
-        "method": "wape_delta",
-        "statistic": round(drop, 4),
-        "threshold": DRIFT_THRESHOLD_POINTS,
-        "triggered": drop > DRIFT_THRESHOLD_POINTS,
-    }])
-    print(f"drift: accuracy reciente {recent_accuracy:.2f} vs baseline {baseline_accuracy:.2f} "
-          f"(caída {drop:.2f} pts, umbral {DRIFT_THRESHOLD_POINTS})")
+    coverage = len(matched) / len(preds)
+    now = datetime.now(timezone.utc).isoformat()
+    metric_rows = [{
+        "run_id": run_id, "model_id": active_model_id, "station_id": None, "split": "live",
+        "metric_name": "coverage_local", "window_label": "last_500", "value": round(coverage, 4),
+        "computed_at": now,
+    }]
+    if len(matched) >= DRIFT_MIN_SAMPLES:
+        err = sum(abs(y - p) for p, y in matched)
+        tot = sum(y for _, y in matched)
+        recent_accuracy = 100 * max(0.0, 1 - err / tot) if tot else 0.0
+        metric_rows.append({
+            "run_id": run_id, "model_id": active_model_id, "station_id": None, "split": "live",
+            "metric_name": "accuracy", "window_label": "recent", "value": round(recent_accuracy, 4),
+            "computed_at": now,
+        })
+        print(f"live: accuracy reciente {recent_accuracy:.2f}, cobertura local {coverage:.0%} "
+              f"({len(matched)}/{len(preds)})")
+        if baseline_accuracy is not None:
+            drop = baseline_accuracy - recent_accuracy
+            db.save_drift_signals(database, [{
+                "run_id": run_id,
+                "station_id": None,
+                "kind": "concept",
+                "feature": "accuracy",
+                "method": "wape_delta",
+                "statistic": round(drop, 4),
+                "threshold": DRIFT_THRESHOLD_POINTS,
+                "triggered": drop > DRIFT_THRESHOLD_POINTS,
+            }])
+            print(f"drift: caída de {drop:.2f} pts vs baseline {baseline_accuracy:.2f} "
+                  f"(umbral {DRIFT_THRESHOLD_POINTS})")
+    else:
+        print(f"live: cobertura local {coverage:.0%} ({len(matched)}/{len(preds)}), "
+              f"insuficiente para accuracy/drift (mínimo {DRIFT_MIN_SAMPLES})")
+    db.save_metrics(database, metric_rows)
 
 
 def main(argv: list[str] | None = None) -> int:
