@@ -1,8 +1,13 @@
 name: pulso-transmi-predict
 
 on:
+  # Desfasado de los minutos redondos (":00, :10, :20...") a propósito: ahí es
+  # donde más workflows de todo GitHub programan su cron, y GitHub mismo
+  # documenta que eso aumenta el retraso. Mismo cadencia de 10 min, sin la
+  # congestión. (Confirmado en este repo: */10 tardó más de 2h en disparar
+  # solo la primera vez.)
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
   workflow_dispatch:
 
 concurrency:
