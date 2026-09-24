@@ -3,8 +3,9 @@ import hashlib
 import httpx
 import pytest
 
+import pulso_pipeline.submit_current_cycle as spc
 from pulso_pipeline.submit_current_cycle import _predictions_hash
-from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient
+from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient, PulsoTransmiError
 
 
 def handler(request: httpx.Request) -> httpx.Response:
@@ -69,3 +70,31 @@ def test_predictions_hash_changes_with_payload() -> None:
     a = [{"station_id": "02300", "target_at": "2026-09-10T03:15:00Z", "value": 10.0}]
     b = [{"station_id": "02300", "target_at": "2026-09-10T03:15:00Z", "value": 11.0}]
     assert _predictions_hash(a) != _predictions_hash(b)
+
+
+def test_fetch_page_with_retries_recovers_after_transient_failure(monkeypatch) -> None:
+    monkeypatch.setattr(spc.time, "sleep", lambda _: None)
+    calls = []
+
+    def flaky(cursor):
+        calls.append(cursor)
+        if len(calls) < 2:
+            raise PulsoTransmiError("GET /v1/stream/observations failed: timed out")
+        return {"data": [], "next_cursor": None}
+
+    result = spc._fetch_page_with_retries(flaky, cursor="cur-1")
+    assert result == {"data": [], "next_cursor": None}
+    assert calls == ["cur-1", "cur-1"]
+
+
+def test_fetch_page_with_retries_raises_after_max_attempts(monkeypatch) -> None:
+    monkeypatch.setattr(spc.time, "sleep", lambda _: None)
+    calls = []
+
+    def always_fails(cursor):
+        calls.append(cursor)
+        raise PulsoTransmiError("GET /v1/stream/observations failed: timed out")
+
+    with pytest.raises(PulsoTransmiError):
+        spc._fetch_page_with_retries(always_fails, cursor=None)
+    assert len(calls) == spc.RETRYABLE_MAX_ATTEMPTS

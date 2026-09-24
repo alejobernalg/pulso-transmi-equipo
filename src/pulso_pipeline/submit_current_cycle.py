@@ -22,7 +22,7 @@ from io import BytesIO
 import joblib
 
 from pulso_forecast import forecast_for_targets, wide_from_frames
-from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient
+from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient, PulsoTransmiError
 
 from . import db
 
@@ -62,13 +62,33 @@ def _synthesize_cursor(fields: list) -> str:
     return base64.urlsafe_b64encode(json.dumps(fields).encode()).decode().rstrip("=")
 
 
+def _fetch_page_with_retries(fetch_page, cursor):
+    """Reintenta una página ante fallas transitorias (timeout, 5xx, 429) con backoff.
+
+    Sin esto, un timeout de red durante el sync tumbaba todo el run aunque el
+    siguiente despertar (5 min después) lo hubiera resuelto solo; ahora se
+    resuelve dentro del mismo run cuando es posible.
+    """
+    last_error: PulsoTransmiError | None = None
+    for attempt in range(1, RETRYABLE_MAX_ATTEMPTS + 1):
+        try:
+            return fetch_page(cursor)
+        except PulsoTransmiError as exc:
+            last_error = exc
+            if attempt == RETRYABLE_MAX_ATTEMPTS:
+                raise
+            print(f"sync intento {attempt} falló ({exc}), reintentando")
+            time.sleep(2 ** attempt)
+    raise last_error  # pragma: no cover - inalcanzable, raise ya ocurrió arriba
+
+
 def _sync_paginated(database, resource: str, fetch_page, upsert, resume_key) -> int:
     """Pagina desde el cursor guardado y solo lo avanza tras un upsert confirmado."""
     cursor = db.get_cursor(database, resource)
     total = 0
     last_row: dict | None = None
     while True:
-        page = fetch_page(cursor)
+        page = _fetch_page_with_retries(fetch_page, cursor)
         rows = page["data"]
         upsert(rows)
         total += len(rows)
