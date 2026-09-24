@@ -11,8 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "numpy>=2",
   "pandas>=2.2,<3",
-  "xgboost>=2,<4",
-  "scikit-learn>=1.5,<2",  # XGBRegressor (API sklearn) lo requiere en tiempo de import
+  "scikit-learn>=1.5,<2",
   "joblib>=1.4",
 ]
 
