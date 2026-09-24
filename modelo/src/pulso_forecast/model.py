@@ -23,6 +23,8 @@ HORIZONS = (1, 2, 3, 4)  # 15, 30, 45, 60 min: contrato oficial (guía operativa
 LAGS = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 48, 96)
 SEASONAL = (96, 192, 672, 1344)
 EVENT_THRESHOLD = 0.1  # event_intensity trae denormales ~1e-323: hay que umbralizar
+ADAPTIVE_HALF_LIFE_DAYS = 14  # peso se reduce a la mitad cada 14 días del mismo tipo (laboral/finde)
+ADAPTIVE_MAX_LOOKBACK_DAYS = 60  # 0.5**(60/14) ~ 0.03: suficiente para que la cola sea despreciable
 
 FEATURES_NOTE = "ver make_frame: lags <= t, estacionalidad alineada al objetivo, calendario y pronósticos en t+h"
 
@@ -62,8 +64,34 @@ def wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFram
 
 
 # ---------------------------------------------------------------------- features
+def _adaptive_profile(y: pd.DataFrame, local, target, target_weekend, h: int, scale: pd.DataFrame) -> np.ndarray:
+    """Generalización de `daytype14`: en vez de un promedio plano de los últimos
+    14 días del mismo tipo, pondera exponencialmente TODO el historial disponible
+    (hasta 60 días del mismo tipo), con vida media de `ADAPTIVE_HALF_LIFE_DAYS`
+    días -- días más recientes pesan más, pero ninguno se descarta del todo.
+    Mismo patrón `y.shift(k-h)` (k = DAY*d, d>=1) que ya usa daytype14, así que
+    hereda la misma garantía de no ver el futuro."""
+    vals, weights = [], []
+    for d in range(1, ADAPTIVE_MAX_LOOKBACK_DAYS + 1):
+        k = DAY * d
+        if k < h:
+            continue
+        v = (y.shift(k - h) / scale).to_numpy().copy()
+        past_weekend = np.asarray((local + pd.Timedelta(minutes=STEP_MIN * (h - k))).dayofweek >= 5)
+        v[past_weekend != target_weekend] = np.nan
+        vals.append(v)
+        weights.append(0.5 ** (d / ADAPTIVE_HALF_LIFE_DAYS))
+    stack = np.stack(vals)
+    w = np.asarray(weights).reshape(-1, 1, 1)
+    w_masked = np.where(np.isnan(stack), 0.0, w)
+    weighted_sum = np.nansum(stack * w, axis=0)
+    weight_total = w_masked.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(weight_total > 0, weighted_sum / weight_total, np.nan)
+
+
 def make_frame(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, h: int,
-               use_ctx: bool = True, event_at_target: bool = False) -> pd.DataFrame:
+               use_ctx: bool = True, event_at_target: bool = False, use_adaptive_profile: bool = True) -> pd.DataFrame:
     """Una fila por (origen t, estación). Columnas `_*` son metadatos, no features."""
     n_t, n_s = y.shape
     scale = y.rolling(WEEK, min_periods=DAY).mean()  # nivel reciente de la estación, solo pasado
@@ -108,6 +136,8 @@ def make_frame(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, h: in
     stack = np.stack(same_type)
     add("daytype14", np.nanmean(stack, axis=0))
     add("daytype14_med", np.nanmedian(stack, axis=0))
+    if use_adaptive_profile:
+        add("adaptive_profile_hl14", _adaptive_profile(y, local, target, target_weekend, h, scale))
     slot = (target.hour * 60 + target.minute) // STEP_MIN
     dow = target.dayofweek
     for name, vec in {
