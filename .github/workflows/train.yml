@@ -7,6 +7,10 @@ on:
         description: "Evaluar y decidir sin escribir en Supabase"
         type: boolean
         default: false
+      tolerance:
+        description: "Puntos de accuracy que el candidato puede perder frente al champion sin bloquear la promoción"
+        type: string
+        default: "0.5"
   # Activar cuando haya al menos una promoción manual validada:
   # schedule:
   #   - cron: "17 6 * * *"
@@ -38,4 +42,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          python -m pulso_pipeline.train_and_promote ${{ inputs.dry_run && '--dry-run' || '' }}
+          python -m pulso_pipeline.train_and_promote ${{ inputs.dry_run && '--dry-run' || '' }} --tolerance ${{ inputs.tolerance }}
