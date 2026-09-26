@@ -374,8 +374,39 @@ def forecast_next(models: dict, horizons=None, data_dir=None) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+BIAS_WINDOW = 8     # últimos 8 objetivos ya observados (2 h) por estación
+BIAS_SHRINK = 0.5   # se aplica la mitad del sesgo medido
+BIAS_CLIP = (0.7, 1.3)
+
+
+def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_end_t: int | None = None) -> pd.Series:
+    """Corrección online de nivel por estación: sum(real)/sum(predicho) sobre los
+    últimos `BIAS_WINDOW` objetivos ya observados en el origen `last_t`
+    (objetivo t+h <= last_t, sin fuga), encogida hacia 1 con `BIAS_SHRINK`.
+
+    Motivo: la plataforma cambia patrones de demanda durante la competencia y el
+    modelo tarda en reaccionar hasta el siguiente reentrenamiento. Validado en
+    dos ventanas en vivo independientes (2026-09-09..14): +0.25 a +1.71 pts en
+    8/8 combinaciones horizonte x ventana (media +0.88). Solo se usan objetivos
+    posteriores a `train_end_t` para no medir residuos in-sample; si no hay
+    suficientes, el factor es 1 (sin corrección)."""
+    tgt = frame["_t"] + h
+    ok = (tgt <= last_t) & frame["_y"].notna() & frame["_scale"].notna()
+    if train_end_t is not None:
+        ok &= tgt > train_end_t
+    past = frame[ok & (tgt > last_t - BIAS_WINDOW)]
+    if past.empty:
+        return pd.Series(dtype=float)
+    df = pd.DataFrame({"station": past["station"].astype(int).to_numpy(),
+                       "y": past["_y"].to_numpy(), "p": predict(model, past)})
+    g = df.groupby("station")
+    sums = g.sum()[g.size() == BIAS_WINDOW]
+    ratio = (sums["y"] / sums["p"].where(sums["p"] > 0)).clip(*BIAS_CLIP).fillna(1.0)
+    return 1 + BIAS_SHRINK * (ratio - 1)
+
+
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
-                          origin, targets) -> pd.DataFrame:
+                          origin, targets, train_cutoff=None) -> pd.DataFrame:
     """Predice exactamente los pares (station_id, target_at) que pide un ciclo.
 
     `origin` es el `data_cutoff` del ciclo (debe ser el último índice de `y`).
@@ -408,6 +439,11 @@ def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stati
         frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, h)
         cur = frame[frame["_t"] == len(y) - 1]
         pred = predict(models[h], cur)
+        train_end_t = None
+        if train_cutoff is not None:
+            train_end_t = int(y.index.searchsorted(pd.Timestamp(train_cutoff), side="right")) - 1
+        factors = recent_bias_factors(models[h], frame, h, len(y) - 1, train_end_t)
+        pred = pred * cur["station"].astype(int).map(factors).fillna(1.0).to_numpy()
         station_ids = stations.index[cur["station"].astype(int)]
         preds_by_h[h] = pd.Series(pred, index=station_ids)
 

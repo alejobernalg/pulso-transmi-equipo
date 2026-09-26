@@ -195,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
             ctx = ctx.loc[:cutoff]
 
             targets = [(t["station_id"], t["target_at"]) for t in cycle["targets"]]
-            preds = forecast_for_targets(bundle["models"], y, ctx, stations, cutoff, targets)
+            preds = forecast_for_targets(bundle["models"], y, ctx, stations, cutoff, targets,
+                                         train_cutoff=bundle["meta"].get("data_cutoff"))
 
             if len(preds) != cycle["expected_predictions"]:
                 raise ValueError(

@@ -47,3 +47,19 @@ def test_seasonal_lags_only_use_the_past():
     t = 2000
     row = f[(f["_t"] == t) & (f["station"] == 0)].iloc[0]
     assert row["seas96"] * row["_scale"] == pytest.approx(y.iloc[t, 0])
+
+
+@pytest.mark.parametrize("h", [1, 4])
+def test_bias_correction_only_uses_observed_targets(h):
+    """El factor de corrección en el origen t solo puede usar objetivos t'+h <= t."""
+    t = 3000
+    frame = pm.make_frame(y, ctx, stations, h)
+    tr, _ = pm.split_by_target(frame, h, train_end=t - 200, val=None)
+    model = pm.fit(tr, {"hgb": {"max_iter": 20}, "lgb": {"n_estimators": 20}, "w_hgb": 0.5})
+    base = pm.recent_bias_factors(model, frame, h, t, train_end_t=t - 200)
+    y2 = y.copy()
+    y2.iloc[t + 1:] = rng.uniform(1e4, 1e5, y2.iloc[t + 1:].shape)
+    dirty = pm.recent_bias_factors(model, pm.make_frame(y2, ctx, stations, h), h, t, train_end_t=t - 200)
+    assert len(base) == len(stations)
+    pd.testing.assert_series_equal(base, dirty)
+    assert base.between(0.85, 1.15).all()
