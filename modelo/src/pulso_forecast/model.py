@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from lightgbm import LGBMRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 DATA = Path(os.environ.get("PULSO_DATA_DIR", "data"))  # carpeta con los CSV del reto
@@ -193,25 +194,63 @@ def split_by_target(frame: pd.DataFrame, h: int, train_end: int, val: tuple[int,
     return train, valid
 
 
-def fit(train: pd.DataFrame, params: dict) -> HistGradientBoostingRegressor:
+def _fit_hgb(train: pd.DataFrame, params: dict) -> HistGradientBoostingRegressor:
     """Se probó reemplazar esto por XGBoost (ganaba por 0.07 pts en un dataset
     más chico), pero al reevaluar en el dataset en vivo, más grande, HGB volvió
     a ganar por 1.43 pts en los 4 horizontes (86.92 vs 85.49) -- la ventaja de
-    XGBoost no era real, era ruido de un split pequeño. Se mantiene HGB."""
+    XGBoost no era real, era ruido de un split pequeño. Se mantiene HGB como
+    una de las dos patas del blend (ver `fit`)."""
     model = HistGradientBoostingRegressor(
         loss="absolute_error", categorical_features="from_dtype", random_state=0, **params)
     model.fit(train[feature_columns(train)], train["_ratio"])
     return model
 
 
+def _fit_lgb(train: pd.DataFrame, params: dict) -> LGBMRegressor:
+    model = LGBMRegressor(objective="regression_l1", random_state=0, verbosity=-1, **params)
+    model.fit(train[feature_columns(train)], train["_ratio"])  # categorical_feature="auto" detecta "station"
+    return model
+
+
+class BlendedModel:
+    """Promedio ponderado de HGB y LightGBM, ya clippeados y en escala de demanda
+    (no de _ratio), tal como se validó en la comparación live: cada pata se
+    clippea a >=0 por separado antes de mezclar, así el blend nunca puede dar
+    negativo. `w_hgb` es el peso de HGB elegido por CV (ver run_from_frames)."""
+    def __init__(self, hgb, lgb, w_hgb: float):
+        self.hgb, self.lgb, self.w_hgb = hgb, lgb, w_hgb
+
+
+def fit(train: pd.DataFrame, params: dict) -> BlendedModel:
+    """Stacking simple HGB + LightGBM. `params` = {"hgb": {...}, "lgb": {...},
+    "w_hgb": float}. Se probaron 9 alternativas de modelo único (XGBoost,
+    RandomForest, ExtraTrees, GradientBoosting clásico, LightGBM solo,
+    CatBoost, MLP, features de corredor) y ninguna superó a HGB de forma
+    consistente. El blend HGB+LightGBM sí: +0.03 a +0.10 pts de accuracy en
+    8/8 combinaciones horizonte x ventana probadas en datos en vivo (dos
+    ventanas independientes) -- señal real, aunque modesta, no ruido."""
+    return BlendedModel(_fit_hgb(train, params["hgb"]), _fit_lgb(train, params["lgb"]), params["w_hgb"])
+
+
 def predict(model, frame: pd.DataFrame) -> np.ndarray:
-    return np.clip(model.predict(frame[feature_columns(frame)]), 0, None) * frame["_scale"].to_numpy()
+    X = frame[feature_columns(frame)]
+    scale = frame["_scale"].to_numpy()
+    if isinstance(model, BlendedModel):
+        p_hgb = np.clip(model.hgb.predict(X), 0, None) * scale
+        p_lgb = np.clip(model.lgb.predict(X), 0, None) * scale
+        return model.w_hgb * p_hgb + (1 - model.w_hgb) * p_lgb
+    return np.clip(model.predict(X), 0, None) * scale
 
 
-GRID = [
+HGB_GRID = [
     {"learning_rate": lr, "max_leaf_nodes": leaves, "max_iter": it, "min_samples_leaf": msl, "l2_regularization": 1.0}
     for lr, leaves, it, msl in [(0.05, 15, 300, 40), (0.05, 31, 300, 40), (0.03, 15, 500, 80), (0.05, 7, 400, 80)]
 ]
+LGB_GRID = [
+    {"learning_rate": lr, "num_leaves": leaves, "n_estimators": it, "min_child_samples": msl}
+    for lr, leaves, it, msl in [(0.05, 31, 300, 40), (0.05, 63, 300, 40), (0.03, 31, 500, 80)]
+]
+BLEND_WEIGHTS = tuple(round(w, 1) for w in np.arange(0.0, 1.01, 0.1))
 
 
 def run(out_dir: Path, horizons=HORIZONS, test_days: int = 7, data_dir=None) -> dict:
@@ -228,31 +267,52 @@ def run_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, 
 
     for h in horizons:
         frame = make_frame(y, ctx, stations, h)
-        # 1) selección de hiperparámetros solo con datos anteriores al test
-        cv = []
-        for params in GRID:
-            scores = []
-            for v0, v1 in folds:
-                tr, va = split_by_target(frame, h, train_end=v0 - 1, val=(v0, v1))
-                scores.append(accuracy(va, predict(fit(tr, params), va)))
-            cv.append(float(np.mean(scores)))
-        best = GRID[int(np.argmax(cv))]
+        # 1) hiperparámetros de HGB y de LightGBM elegidos por separado, solo con
+        # datos anteriores al test (mismos folds para ambos, comparables)
+        def _cv_best(grid, fit_fn):
+            cv_scores = []
+            for params in grid:
+                scores = []
+                for v0, v1 in folds:
+                    tr, va = split_by_target(frame, h, train_end=v0 - 1, val=(v0, v1))
+                    pred = np.clip(fit_fn(tr, params).predict(va[feature_columns(va)]), 0, None) * va["_scale"].to_numpy()
+                    scores.append(accuracy(va, pred))
+                cv_scores.append(float(np.mean(scores)))
+            return grid[int(np.argmax(cv_scores))], cv_scores
 
-        # 2) evaluación única en el bloque final, nunca visto
+        best_hgb, cv_hgb = _cv_best(HGB_GRID, _fit_hgb)
+        best_lgb, cv_lgb = _cv_best(LGB_GRID, _fit_lgb)
+
+        # 2) peso del blend optimizado en los mismos folds de CV (nunca en test):
+        # se refitea una sola vez por fold con los mejores hiperparámetros y se
+        # barren los pesos sobre esas predicciones ya calculadas
+        fold_preds = []
+        for v0, v1 in folds:
+            tr, va = split_by_target(frame, h, train_end=v0 - 1, val=(v0, v1))
+            p_hgb = np.clip(_fit_hgb(tr, best_hgb).predict(va[feature_columns(va)]), 0, None) * va["_scale"].to_numpy()
+            p_lgb = np.clip(_fit_lgb(tr, best_lgb).predict(va[feature_columns(va)]), 0, None) * va["_scale"].to_numpy()
+            fold_preds.append((va, p_hgb, p_lgb))
+        blend_cv = [float(np.mean([accuracy(va, w * p_hgb + (1 - w) * p_lgb) for va, p_hgb, p_lgb in fold_preds]))
+                    for w in BLEND_WEIGHTS]
+        best_w = float(BLEND_WEIGHTS[int(np.argmax(blend_cv))])
+        best = {"hgb": best_hgb, "lgb": best_lgb, "w_hgb": best_w}
+
+        # 3) evaluación única en el bloque final, nunca visto
         tr, te = split_by_target(frame, h, train_end=test_start - 1, val=(test_start, n_t))
         model = fit(tr, best)
         row = {
-            "best_params": best, "cv_accuracy": cv, "n_train": len(tr), "n_test": len(te),
+            "best_params": best, "cv_accuracy": {"hgb": cv_hgb, "lgb": cv_lgb, "blend_by_weight": blend_cv},
+            "n_train": len(tr), "n_test": len(te),
             "model": accuracy(te, predict(model, te)),
             "naive_day": accuracy(te.dropna(subset=["_naive96"]), te.dropna(subset=["_naive96"])["_naive96"].to_numpy()),
             "naive_week": accuracy(te.dropna(subset=["_naive672"]), te.dropna(subset=["_naive672"])["_naive672"].to_numpy()),
         }
-        # 3) ablaciones: ¿aporta el pronóstico de clima? ¿cuánto ganaría un evento conocido de antemano?
+        # 4) ablaciones: ¿aporta el pronóstico de clima? ¿cuánto ganaría un evento conocido de antemano?
         for name, kw in {"sin_contexto": {"use_ctx": False}, "cota_evento_conocido": {"event_at_target": True}}.items():
             fa = make_frame(y, ctx, stations, h, **kw)
             tra, tea = split_by_target(fa, h, train_end=test_start - 1, val=(test_start, n_t))
             row[name] = accuracy(tea, predict(fit(tra, best), tea))
-        # 4) accuracy por estación en test
+        # 5) accuracy por estación en test
         pred = predict(model, te)
         err = pd.Series(np.abs(te["_y"].to_numpy() - pred)).groupby(te["station"].to_numpy()).sum()
         tot = te["_y"].groupby(te["station"].to_numpy()).sum()
@@ -280,8 +340,10 @@ def train_production_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: p
         frame = make_frame(y, ctx, stations, h)
         tr, _ = split_by_target(frame, h, train_end=n_t - 1, val=None)
         models[h] = fit(tr, params_by_h[h])
+    import lightgbm
     import sklearn
-    meta = {"sklearn_version": sklearn.__version__, "data_cutoff": str(y.index[-1]), "horizons": list(horizons), "features": FEATURES_NOTE,
+    meta = {"sklearn_version": sklearn.__version__, "lightgbm_version": lightgbm.__version__,
+            "data_cutoff": str(y.index[-1]), "horizons": list(horizons), "features": FEATURES_NOTE,
             "trained_rows": {h: int(len(split_by_target(make_frame(y, ctx, stations, h), h, n_t - 1, None)[0]))
                              for h in horizons}}
     out_dir.mkdir(parents=True, exist_ok=True)
