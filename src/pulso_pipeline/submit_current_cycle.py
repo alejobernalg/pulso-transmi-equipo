@@ -28,6 +28,8 @@ from . import db
 
 STEP_MIN = 15
 RETRYABLE_MAX_ATTEMPTS = 3
+CONTEXT_STALE_HOURS = 20.0  # el feed de contexto (clima/eventos) puede atrasarse
+# un poco por su cuenta; más de esto sin filas nuevas es anómalo, no solo lag normal
 
 
 def git_commit() -> str | None:
@@ -122,6 +124,28 @@ def sync_context(client: PulsoTransmiClient, database) -> int:
     )
 
 
+def check_context_freshness(database, run_id: str) -> None:
+    """El feed de `context` (clima/eventos) puede quedarse atrás del de
+    `observations` sin que ninguna llamada falle -- la API simplemente
+    devuelve 0 filas nuevas. Eso pasó realmente: el cursor no avanzó por 3
+    días seguidos sin que nada se rompiera ni se viera en ningún lado. Esto
+    deja evidencia en `drift_signals` para que sea visible sin tener que
+    comparar cursores a mano."""
+    updated_at = db.get_cursor_updated_at(database, "context")
+    if updated_at is None:
+        return
+    stale_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)).total_seconds() / 3600
+    triggered = stale_hours > CONTEXT_STALE_HOURS
+    if triggered:
+        print(f"aviso: el feed de contexto no trae filas nuevas hace {stale_hours:.1f}h "
+              f"(umbral {CONTEXT_STALE_HOURS}h) -- puede ser lag normal de la fuente o un corte real")
+    db.save_drift_signals(database, [{
+        "run_id": run_id, "station_id": None, "kind": "data", "feature": "context_sync",
+        "method": "cursor_staleness_hours", "statistic": round(stale_hours, 2),
+        "threshold": CONTEXT_STALE_HOURS, "triggered": triggered,
+    }])
+
+
 def _predictions_hash(payload: list[dict]) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
@@ -141,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
             n_obs = sync_observations(client, database)
             n_ctx = sync_context(client, database)
             print(f"sync: {n_obs} observaciones, {n_ctx} periodos de contexto")
+            check_context_freshness(database, run_id)
 
             cycle = client.current_cycle()
             if cycle is None:

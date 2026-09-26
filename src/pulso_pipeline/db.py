@@ -52,6 +52,14 @@ def get_cursor(db: Client, resource: str) -> str | None:
     return rows[0]["cursor"] if rows else None
 
 
+def get_cursor_updated_at(db: Client, resource: str) -> str | None:
+    """Última vez que el cursor de `resource` avanzó (encontró filas nuevas),
+    no la última vez que se intentó sincronizar. Sirve para detectar un feed
+    fuente atascado (ver check_context_freshness en submit_current_cycle)."""
+    rows = db.table("sync_state").select("updated_at").eq("resource", resource).execute().data
+    return rows[0]["updated_at"] if rows else None
+
+
 def set_cursor(db: Client, resource: str, cursor: str | None) -> None:
     db.table("sync_state").upsert(
         {"resource": resource, "cursor": cursor, "updated_at": datetime.now(timezone.utc).isoformat()}
