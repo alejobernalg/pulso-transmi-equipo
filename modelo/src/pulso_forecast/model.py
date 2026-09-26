@@ -106,6 +106,9 @@ def make_frame(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, h: in
     for w in (4, 16, 96):
         add(f"mean{w}", y.rolling(w).mean() / scale)
     add("std16", y.rolling(16).std() / scale)
+    # tendencia de corto plazo (última hora vs últimas 4 h): +0.08 pts medios, 7/8
+    # combinaciones horizonte x ventana en vivo con la corrección de sesgo activa
+    add("trend4_16", y.rolling(4).mean() / y.rolling(16).mean())
     seasonal = []
     for k in SEASONAL:
         if k >= h:  # y_{t+h-k} ya ocurrió en t solo si k >= h
@@ -233,7 +236,10 @@ def fit(train: pd.DataFrame, params: dict) -> BlendedModel:
 
 
 def predict(model, frame: pd.DataFrame) -> np.ndarray:
-    X = frame[feature_columns(frame)]
+    # columnas con las que se entrenó el modelo (no las del frame actual): así un
+    # modelo activo sigue prediciendo aunque el código agregue features nuevas
+    trained = model.hgb if isinstance(model, BlendedModel) else model
+    X = frame[list(getattr(trained, "feature_names_in_", feature_columns(frame)))]
     scale = frame["_scale"].to_numpy()
     if isinstance(model, BlendedModel):
         p_hgb = np.clip(model.hgb.predict(X), 0, None) * scale
