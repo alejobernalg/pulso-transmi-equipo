@@ -92,10 +92,11 @@ def _adaptive_profile(y: pd.DataFrame, local, target, target_weekend, h: int, sc
 
 
 def make_frame(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, h: int,
-               use_ctx: bool = True, event_at_target: bool = False, use_adaptive_profile: bool = True) -> pd.DataFrame:
+               use_ctx: bool = True, event_at_target: bool = False, use_adaptive_profile: bool = True,
+               scale_window: int = WEEK) -> pd.DataFrame:
     """Una fila por (origen t, estación). Columnas `_*` son metadatos, no features."""
     n_t, n_s = y.shape
-    scale = y.rolling(WEEK, min_periods=DAY).mean()  # nivel reciente de la estación, solo pasado
+    scale = y.rolling(scale_window, min_periods=min(DAY, scale_window)).mean()  # nivel reciente de la estación, solo pasado
     cols: dict[str, np.ndarray] = {}
 
     def add(name: str, wide: pd.DataFrame | np.ndarray):
@@ -330,6 +331,17 @@ def run_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, 
     return report
 
 
+# Periodos finales que el modelo de producción NO ve al entrenar: así la corrección
+# de sesgo (que solo usa objetivos posteriores al corte) tiene ventana completa desde
+# el primer ciclo tras un reentrenamiento, en vez de quedar apagada 2-4 ciclos.
+PRODUCTION_HOLDOUT = 20  # = BREAK_WINDOW + max(HORIZONS)
+
+
+def production_train_end(n_t: int) -> int:
+    """Último índice de objetivo que entra al entrenamiento de producción."""
+    return n_t - 1 - PRODUCTION_HOLDOUT
+
+
 def train_production(out_dir: Path, params_by_h: dict[int, dict], horizons=HORIZONS, data_dir=None):
     """Reentrena con TODOS los datos disponibles y guarda un modelo por horizonte."""
     y, ctx, stations = load_data(data_dir)
@@ -340,17 +352,17 @@ def train_production_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: p
                                   params_by_h: dict[int, dict], horizons=HORIZONS) -> dict:
     """Igual que `train_production` pero a partir de frames ya cargados (p. ej. desde Supabase)."""
     import joblib
-    n_t = len(y)
+    train_end = production_train_end(len(y))
     models = {}
     for h in horizons:
         frame = make_frame(y, ctx, stations, h)
-        tr, _ = split_by_target(frame, h, train_end=n_t - 1, val=None)
+        tr, _ = split_by_target(frame, h, train_end=train_end, val=None)
         models[h] = fit(tr, params_by_h[h])
     import lightgbm
     import sklearn
     meta = {"sklearn_version": sklearn.__version__, "lightgbm_version": lightgbm.__version__,
-            "data_cutoff": str(y.index[-1]), "horizons": list(horizons), "features": FEATURES_NOTE,
-            "trained_rows": {h: int(len(split_by_target(make_frame(y, ctx, stations, h), h, n_t - 1, None)[0]))
+            "data_cutoff": str(y.index[train_end]), "horizons": list(horizons), "features": FEATURES_NOTE,
+            "trained_rows": {h: int(len(split_by_target(make_frame(y, ctx, stations, h), h, train_end, None)[0]))
                              for h in horizons}}
     out_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump({"models": models, "meta": meta}, out_dir / "model.joblib")
