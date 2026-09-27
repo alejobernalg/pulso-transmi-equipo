@@ -151,6 +151,26 @@ def _predictions_hash(payload: list[dict]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+# La plataforma abre cada ciclo hacia el minuto :45 (unos segundos después). Si la
+# corrida de las :45 pregunta un instante antes, sin esta espera el envío se iba a
+# la corrida siguiente (:50). Solo se espera cerca de la apertura, para no gastar
+# minutos de Actions en las demás corridas.
+CYCLE_OPEN_MINUTES = range(40, 50)
+CYCLE_WAIT_SECONDS = 180
+CYCLE_POLL_SECONDS = 10
+
+
+def _wait_for_cycle(client: PulsoTransmiClient):
+    cycle = client.current_cycle()
+    if cycle is not None or datetime.now(timezone.utc).minute not in CYCLE_OPEN_MINUTES:
+        return cycle
+    deadline = time.monotonic() + CYCLE_WAIT_SECONDS
+    while cycle is None and time.monotonic() < deadline:
+        time.sleep(CYCLE_POLL_SECONDS)
+        cycle = client.current_cycle()
+    return cycle
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="arma y valida el batch, no lo envía")
@@ -167,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"sync: {n_obs} observaciones, {n_ctx} periodos de contexto")
             check_context_freshness(database, run_id)
 
-            cycle = client.current_cycle()
+            cycle = _wait_for_cycle(client)
             if cycle is None:
                 print("no hay ciclo abierto (404 no_open_cycle): fin en verde")
                 db.finish_run(database, run_id, status="success", decision="keep",
