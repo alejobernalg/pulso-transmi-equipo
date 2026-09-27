@@ -61,7 +61,83 @@ def wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFram
     assert orphan_ctx.empty, f"context tiene {len(orphan_ctx)} periodos sin observaciones"
     ctx = ctx.reindex(y.index)
     stations = stations.set_index("station_id").loc[y.columns]
-    return y, ctx, stations
+    return align_peak_shifts(y), ctx, stations
+
+
+# ------------------------------------------------------------ corrimiento de picos
+# El generador de la plataforma incluye drifts `peak_shift` (docs/pattern-generator.md del
+# repo público del profesor): el pico diario de algunas estaciones se corre N minutos. Las
+# features estacionales (lags de 1 día / 1 semana, perfiles) quedan desfasadas y el modelo
+# predice el pico a la hora vieja. En vivo (11-sep) 4 estaciones corrieron su pico +45 min.
+# Se detecta por estación comparando la forma diaria reciente contra el perfil previo a la
+# competencia, y se corre el historial anterior al cambio para que quede alineado.
+# Validado en dos ventanas posteriores al cambio: +0.96 a +2.31 pts (8/8), con las estaciones
+# afectadas subiendo +1.3 a +7.0 pts y el resto sin cambio.
+COMPETITION_START = pd.Timestamp("2026-09-09T05:00:00Z")  # fin de la historia inicial (/v1/meta)
+SHIFT_MAX = 6            # se buscan corrimientos de hasta ±90 min
+SHIFT_MIN = 2            # ±15 min es ruido día a día; el drift real fue de 3 periodos
+SHIFT_ERR_RATIO = 0.8    # el perfil corrido debe reducir el error de forma al menos 20%
+SHIFT_MIN_SLOTS = 48     # un día cuenta solo si tiene al menos 12 h observadas
+
+
+def _day_shift(day: np.ndarray, base: np.ndarray) -> tuple[int, float]:
+    """Mejor corrimiento k (en periodos) del perfil base para explicar la forma del día."""
+    v = ~np.isnan(day)
+    d = day[v] / day[v].sum()
+    errs = {}
+    for k in range(-SHIFT_MAX, SHIFT_MAX + 1):
+        b = np.roll(base, k)[v]
+        errs[k] = float(np.abs(d - b / b.sum()).sum())
+    k = min(errs, key=errs.get)
+    return k, errs[k] / errs[0] if errs[0] > 0 else 1.0
+
+
+def detect_peak_shifts(y: pd.DataFrame) -> dict:
+    """{station_id: (k, cambio)} para estaciones cuyo pico diario se corrió de forma sostenida.
+    Solo usa datos de `y` (pasado), así que es seguro en inferencia."""
+    if y.index[-1] <= COMPETITION_START:
+        return {}
+    local = y.index.tz_convert(TZ)
+    slot = np.asarray(local.hour * 4 + local.minute // STEP_MIN)
+    weekend = np.asarray(local.dayofweek >= 5)
+    pre = np.asarray(y.index < COMPETITION_START)
+    base = {we: y[pre & (weekend == we)].groupby(slot[pre & (weekend == we)]).mean().reindex(range(DAY))
+            for we in (False, True)}
+    days = pd.date_range(COMPETITION_START.tz_convert(TZ).normalize(), local[-1].normalize(), freq="D")
+    shifts = {}
+    for sid in y.columns:
+        per_day = []
+        for day in days:
+            m = np.asarray((local >= day) & (local < day + pd.Timedelta(days=1)))
+            if m.sum() < SHIFT_MIN_SLOTS:
+                continue
+            prof = pd.Series(y[sid].to_numpy()[m], index=slot[m]).groupby(level=0).mean().reindex(range(DAY)).to_numpy()
+            k, ratio = _day_shift(prof, base[day.dayofweek >= 5][sid].to_numpy())
+            per_day.append((day, k if abs(k) >= SHIFT_MIN and ratio < SHIFT_ERR_RATIO else 0))
+        recent = [k for _, k in per_day[-3:]]
+        nonzero = [k for k in recent if k != 0]
+        if len(nonzero) < 2 or len({np.sign(k) for k in nonzero}) > 1:
+            continue
+        k = int(pd.Series(nonzero).mode().iloc[0])
+        first = per_day[-1][0]
+        for day, dk in reversed(per_day):  # inicio del tramo final de días corridos
+            if dk == 0:
+                break
+            first = day
+        shifts[sid] = (k, (first - pd.Timedelta(hours=12)).tz_convert("UTC"))
+    return shifts
+
+
+def align_peak_shifts(y: pd.DataFrame) -> pd.DataFrame:
+    """Corre el historial previo a cada cambio de pico para alinearlo con el régimen actual."""
+    shifts = detect_peak_shifts(y)
+    if not shifts:
+        return y
+    y = y.copy()
+    for sid, (k, change) in shifts.items():
+        before = y.index < change
+        y.loc[before, sid] = y[sid].shift(k)[before].fillna(y[sid][before])  # bordes: valor original
+    return y
 
 
 # ---------------------------------------------------------------------- features

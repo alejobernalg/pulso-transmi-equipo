@@ -63,3 +63,16 @@ def test_bias_correction_only_uses_observed_targets(h):
     assert len(base) == len(stations)
     pd.testing.assert_series_equal(base, dirty)
     assert base.between(*pm.BREAK_CLIP).all()
+
+
+def test_peak_shift_detected_and_aligned(monkeypatch):
+    """Un pico corrido +45 min en los últimos días se detecta y el historial previo se alinea."""
+    start = y.index[-6 * pm.DAY]
+    monkeypatch.setattr(pm, "COMPETITION_START", y.index[-8 * pm.DAY])
+    y2 = y.copy()
+    sid = y.columns[0]
+    y2.loc[y2.index >= start, sid] = y[sid].shift(3)[y2.index >= start]
+    shifts = pm.detect_peak_shifts(y2)
+    assert set(shifts) == {sid} and shifts[sid][0] == 3
+    assert pm.detect_peak_shifts(pm.align_peak_shifts(y2)) == {}
+    assert pm.detect_peak_shifts(y) == {}
