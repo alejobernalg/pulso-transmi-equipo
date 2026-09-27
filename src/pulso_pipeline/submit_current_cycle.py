@@ -154,10 +154,10 @@ def _predictions_hash(payload: list[dict]) -> str:
 # La plataforma abre cada ciclo hacia el minuto :45 (unos segundos después). Si la
 # corrida de las :45 pregunta un instante antes, sin esta espera el envío se iba a
 # la corrida siguiente (:50). Solo se espera cerca de la apertura, para no gastar
-# minutos de Actions en las demás corridas.
+# minutos de Actions en las corridas de respaldo.
 CYCLE_OPEN_MINUTES = range(40, 50)
 CYCLE_WAIT_SECONDS = 180
-CYCLE_POLL_SECONDS = 10
+CYCLE_POLL_SECONDS = 30
 
 
 def _wait_for_cycle(client: PulsoTransmiClient):
