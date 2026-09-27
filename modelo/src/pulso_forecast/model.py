@@ -383,6 +383,12 @@ def forecast_next(models: dict, horizons=None, data_dir=None) -> pd.DataFrame:
 BIAS_WINDOW = 8     # últimos 8 objetivos ya observados (2 h) por estación
 BIAS_SHRINK = 0.5   # se aplica la mitad del sesgo medido
 BIAS_CLIP = (0.7, 1.3)
+# quiebre de nivel: si el sesgo de 8 y de 16 periodos coincide en signo y ambos
+# superan este umbral relativo, la estación cambió de régimen (p. ej. Banderas
+# cayó a la mitad el 13-sep) y se corrige completo con un rango amplio
+BREAK_WINDOW = 16
+BREAK_THRESHOLD = 0.2
+BREAK_CLIP = (0.3, 2.0)
 
 
 def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_end_t: int | None = None) -> pd.Series:
@@ -400,15 +406,22 @@ def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_e
     ok = (tgt <= last_t) & frame["_y"].notna() & frame["_scale"].notna()
     if train_end_t is not None:
         ok &= tgt > train_end_t
-    past = frame[ok & (tgt > last_t - BIAS_WINDOW)]
+    past = frame[ok & (tgt > last_t - max(BIAS_WINDOW, BREAK_WINDOW))]
     if past.empty:
         return pd.Series(dtype=float)
-    df = pd.DataFrame({"station": past["station"].astype(int).to_numpy(),
+    df = pd.DataFrame({"station": past["station"].astype(int).to_numpy(), "t": (past["_t"] + h).to_numpy(),
                        "y": past["_y"].to_numpy(), "p": predict(model, past)})
-    g = df.groupby("station")
-    sums = g.sum()[g.size() == BIAS_WINDOW]
-    ratio = (sums["y"] / sums["p"].where(sums["p"] > 0)).clip(*BIAS_CLIP).fillna(1.0)
-    return 1 + BIAS_SHRINK * (ratio - 1)
+
+    def _ratio(window: int) -> pd.Series:
+        g = df[df["t"] > last_t - window].groupby("station")
+        sums = g[["y", "p"]].sum()[g.size() == window]
+        return sums["y"] / sums["p"].where(sums["p"] > 0)
+
+    short, long = _ratio(BIAS_WINDOW), _ratio(BREAK_WINDOW).reindex(_ratio(BIAS_WINDOW).index)
+    factor = 1 + BIAS_SHRINK * (short.clip(*BIAS_CLIP) - 1)
+    brk = ((short - 1).abs() > BREAK_THRESHOLD) & ((long - 1).abs() > BREAK_THRESHOLD) & (np.sign(short - 1) == np.sign(long - 1))
+    factor[brk] = short[brk].clip(*BREAK_CLIP)
+    return factor.fillna(1.0)
 
 
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,

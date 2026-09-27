@@ -62,4 +62,4 @@ def test_bias_correction_only_uses_observed_targets(h):
     dirty = pm.recent_bias_factors(model, pm.make_frame(y2, ctx, stations, h), h, t, train_end_t=t - 200)
     assert len(base) == len(stations)
     pd.testing.assert_series_equal(base, dirty)
-    assert base.between(0.85, 1.15).all()
+    assert base.between(*pm.BREAK_CLIP).all()
