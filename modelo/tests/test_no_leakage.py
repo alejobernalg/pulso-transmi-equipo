@@ -76,3 +76,23 @@ def test_peak_shift_detected_and_aligned(monkeypatch):
     assert set(shifts) == {sid} and shifts[sid][0] == 3
     assert pm.detect_peak_shifts(pm.align_peak_shifts(y2)) == {}
     assert pm.detect_peak_shifts(y) == {}
+
+
+def test_level_shift_detected_and_aligned(monkeypatch):
+    """Un salto de nivel x2.5 en una estación se detecta cerca de donde ocurrió y la historia
+    previa se reescala al nivel nuevo; las demás estaciones no se tocan."""
+    monkeypatch.setattr(pm, "COMPETITION_START", y.index[-8 * pm.DAY])
+    start = y.index[-2 * pm.DAY]
+    y2 = y.copy()
+    sid = y.columns[0]
+    y2.loc[y2.index >= start, sid] *= 2.5
+    shifts = pm.detect_level_shifts(y2)
+    assert set(shifts) == {sid}
+    assert abs(shifts[sid][-1] - start) <= pd.Timedelta(hours=2)
+    aligned = pm.align_level_shifts(y2)
+    before = aligned.index < start - pd.Timedelta(hours=2)
+    ratio = aligned.loc[before, sid].sum() / y.loc[before, sid].sum()
+    assert ratio == pytest.approx(2.5, rel=0.1)
+    pd.testing.assert_frame_equal(aligned.drop(columns=sid), y2.drop(columns=sid))
+    assert pm.detect_level_shifts(y) == {}
+

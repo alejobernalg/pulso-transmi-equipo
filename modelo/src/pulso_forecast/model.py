@@ -41,7 +41,8 @@ def load_data(data_dir: Path | str | None = None):
 
 def wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame):
     """Construye (y, ctx, stations) en formato ancho a partir de DataFrames ya
-    cargados (de CSV o de Supabase).
+    cargados (de CSV o de Supabase), con la historia ya alineada al régimen
+    actual (`align_history`).
 
     `context` puede ir más atrás que `observations` (en el pipeline en vivo,
     `/v1/stream/observations` libera periodos nuevos antes de que
@@ -49,6 +50,12 @@ def wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFram
     forma nativa. Lo que sí es un error real es que `context` tenga periodos
     que `observations` no tiene (huérfanos).
     """
+    y, ctx, stations = raw_wide_from_frames(obs, ctx, stations)
+    return align_history(y), ctx, stations
+
+
+def raw_wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame):
+    """Como `wide_from_frames` pero sin alinear la historia (demanda tal cual se observó)."""
     obs = obs.copy()
     ctx = ctx.copy()
     for frame in (obs, ctx):
@@ -61,7 +68,13 @@ def wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFram
     assert orphan_ctx.empty, f"context tiene {len(orphan_ctx)} periodos sin observaciones"
     ctx = ctx.reindex(y.index)
     stations = stations.set_index("station_id").loc[y.columns]
-    return align_peak_shifts(y), ctx, stations
+    return y, ctx, stations
+
+
+def align_history(y: pd.DataFrame) -> pd.DataFrame:
+    """Alinea la historia al régimen actual de cada estación: primero el horario del
+    pico, luego el nivel. Solo usa datos de `y`, así que es seguro en inferencia."""
+    return align_level_shifts(align_peak_shifts(y))
 
 
 # ------------------------------------------------------------ corrimiento de picos
@@ -137,6 +150,99 @@ def align_peak_shifts(y: pd.DataFrame) -> pd.DataFrame:
     for sid, (k, change) in shifts.items():
         before = y.index < change
         y.loc[before, sid] = y[sid].shift(k)[before].fillna(y[sid][before])  # bordes: valor original
+    return y
+
+
+# ------------------------------------------------------------ cambios de nivel
+# El generador también aplica cambios bruscos de nivel por estación durante la competencia
+# (16-sep: Portal Américas x2.6, Calle 100 x2.4, Portal Suba x0.4; Banderas cayó por escalones
+# hasta x0.2). El nivel de 7 días, los lags y los perfiles quedan días en el régimen viejo y
+# la corrección online de sesgo no alcanza a compensarlo. Se detecta cada quiebre sobre el
+# nivel horario (demanda / perfil previo a la competencia) y se reescala la historia anterior
+# al nivel del tramo actual, como `align_peak_shifts` hace con el horario del pico.
+# Replay en vivo (pulso_forecast.replay), junto con BREAK_CLIP ampliado: +0.95 pts en la
+# ventana con quiebres (14..18-sep: Banderas +8.4, Américas +1.5, Ricaurte +0.9, Suba +0.6)
+# y -0.02 en la ventana sin quiebres grandes (11..14-sep), peor estación estable -0.15.
+# Umbrales elegidos entre tres calibraciones: los más laxos (3 h, x1.3, z 4) confundían el
+# corrimiento de picos del 11-sep con cambios de nivel (-0.07 en la ventana sin quiebres).
+LEVEL_BLOCK = 4                  # periodos por bloque (1 h)
+LEVEL_MIN_AFTER = 4              # bloques mínimos después del quiebre
+LEVEL_MAX_BEFORE = 24            # bloques de referencia antes del quiebre
+LEVEL_MIN_CHANGE = np.log(1.35)  # cambio mínimo de nivel (log)
+LEVEL_MIN_Z = 5.0                # separación mínima (estadístico t de dos tramos)
+LEVEL_LOOKBACK = pd.Timedelta(days=7)  # el nivel se mide desde 7 días antes de la competencia
+
+
+def _block_levels(y: pd.DataFrame) -> pd.DataFrame:
+    """log(sum(y) / sum(perfil previo a la competencia)) por bloque horario y estación."""
+    local = y.index.tz_convert(TZ)
+    slot = np.asarray(local.hour * 4 + local.minute // STEP_MIN)
+    weekend = np.asarray(local.dayofweek >= 5)
+    pre = np.asarray(y.index < COMPETITION_START)
+    base = np.full(y.shape, np.nan)
+    for we in (False, True):
+        m = weekend == we
+        prof = y[pre & m].groupby(slot[pre & m]).mean()
+        base[m] = prof.reindex(slot[m]).to_numpy()
+    start = COMPETITION_START - LEVEL_LOOKBACK
+    yy = y.loc[start:]
+    bb = pd.DataFrame(base, index=y.index, columns=y.columns).loc[start:]
+    blk = np.arange(len(yy)) // LEVEL_BLOCK
+    num = yy.groupby(blk).sum(min_count=LEVEL_BLOCK)
+    den = bb.groupby(blk).sum(min_count=LEVEL_BLOCK)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lv = np.log((num / den).where((num > 0) & (den > 0)))
+    lv.index = yy.index[::LEVEL_BLOCK][: len(lv)]
+    return lv
+
+
+def _latest_level_break(x: np.ndarray) -> tuple[int, float, float] | None:
+    """Quiebre más reciente en la serie de log-nivel `x`: (índice, cambio, z) o None."""
+    best = None
+    for tau in range(len(x) - LEVEL_MIN_AFTER, 0, -1):
+        after, before = x[tau:], x[max(0, tau - LEVEL_MAX_BEFORE):tau]
+        if len(before) < LEVEL_MIN_AFTER:
+            break
+        diff = after.mean() - before.mean()
+        s = np.sqrt(np.var(np.r_[after - after.mean(), before - before.mean()]) + 1e-6)
+        z = abs(diff) / (s * np.sqrt(1 / len(after) + 1 / len(before)))
+        if abs(diff) > LEVEL_MIN_CHANGE and z > LEVEL_MIN_Z and (best is None or z > best[2]):
+            best = (tau, float(diff), float(z))
+    return best
+
+
+def detect_level_shifts(y: pd.DataFrame) -> dict:
+    """{station_id: [inicio de cada tramo nuevo, ...]} para estaciones con quiebres de nivel
+    desde la competencia. Busca el quiebre más reciente y repite hacia atrás."""
+    if y.index[-1] <= COMPETITION_START:
+        return {}
+    lv = _block_levels(y)
+    out = {}
+    for sid in y.columns:
+        s = lv[sid].dropna()
+        x, idx = s.to_numpy(), s.index
+        breaks, end = [], len(x)
+        while (b := _latest_level_break(x[:end])) is not None:
+            breaks.append(idx[b[0]])
+            end = b[0]
+        if breaks:
+            out[sid] = sorted(breaks)
+    return out
+
+
+def align_level_shifts(y: pd.DataFrame) -> pd.DataFrame:
+    """Reescala cada tramo anterior a un quiebre de nivel al nivel del tramo actual."""
+    shifts = detect_level_shifts(y)
+    if not shifts:
+        return y
+    lv = _block_levels(y)
+    y = y.copy()
+    for sid, breaks in shifts.items():
+        edges = [y.index[0], *breaks, y.index[-1] + pd.Timedelta(minutes=STEP_MIN)]
+        levels = [np.exp(lv[sid][(lv.index >= a) & (lv.index < b)].mean()) for a, b in zip(edges[:-1], edges[1:])]
+        for a, b, lvl in zip(edges[:-2], edges[1:-1], levels[:-1]):
+            seg = (y.index >= a) & (y.index < b)
+            y.loc[seg, sid] = y.loc[seg, sid] * (levels[-1] / lvl)
     return y
 
 
@@ -342,7 +448,11 @@ def run(out_dir: Path, horizons=HORIZONS, test_days: int = 7, data_dir=None) -> 
 
 
 def run_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, out_dir: Path,
-                     horizons=HORIZONS, test_days: int = 7) -> dict:
+                     horizons=HORIZONS, test_days: int = 7, reference: dict | None = None) -> dict:
+    """Validación temporal. Con `reference` = {"models": {h: modelo}, "train_cutoff": ts}
+    (el champion), agrega por horizonte `same_block`: la receta candidata reentrenada con
+    el mismo corte que el champion, y ambos medidos sobre los mismos objetivos posteriores
+    a ese corte (ninguno los vio al entrenar)."""
     n_t = len(y)
     test_start = n_t - test_days * DAY
     folds = [(test_start - 2 * WEEK, test_start - WEEK), (test_start - WEEK, test_start)]
@@ -395,7 +505,16 @@ def run_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, 
             fa = make_frame(y, ctx, stations, h, **kw)
             tra, tea = split_by_target(fa, h, train_end=test_start - 1, val=(test_start, n_t))
             row[name] = accuracy(tea, predict(fit(tra, best), tea))
-        # 5) accuracy por estación en test
+        # 5) champion vs candidato con la misma información: el candidato se reentrena con el
+        # corte del champion y ambos se miden en los objetivos posteriores (fuera de muestra)
+        if reference is not None and h in reference["models"]:
+            ref_end_t = int(y.index.searchsorted(pd.Timestamp(reference["train_cutoff"]), side="right")) - 1
+            tr_ref, sub = split_by_target(frame, h, train_end=ref_end_t, val=(ref_end_t + 1, n_t))
+            if not sub.empty:
+                row["same_block"] = {"n_targets": int(len(sub)), "from": str(y.index[min(ref_end_t + 1, n_t - 1)]),
+                                     "model": accuracy(sub, predict(fit(tr_ref, best), sub)),
+                                     "reference": accuracy(sub, predict(reference["models"][h], sub))}
+        # 6) accuracy por estación en test
         pred = predict(model, te)
         err = pd.Series(np.abs(te["_y"].to_numpy() - pred)).groupby(te["station"].to_numpy()).sum()
         tot = te["_y"].groupby(te["station"].to_numpy()).sum()
@@ -476,7 +595,11 @@ BIAS_CLIP = (0.7, 1.3)
 # cayó a la mitad el 13-sep) y se corrige completo con un rango amplio
 BREAK_WINDOW = 16
 BREAK_THRESHOLD = 0.2
-BREAK_CLIP = (0.3, 2.0)
+# Rango ampliado de (0.3, 2.0): el 16-sep Portal Américas subió x2.5 y Banderas bajó a
+# x0.4 otra vez, y el factor quedaba topado en el límite. Replay (pulso_forecast.replay)
+# sobre dos ventanas en vivo: +0.19 pts en la ventana con esos quiebres (Américas +1.36,
+# Banderas +0.9), neutral en la otra (-0.003) y ninguna estación estable baja más de 0.03.
+BREAK_CLIP = (0.2, 3.0)
 
 
 def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_end_t: int | None = None) -> pd.Series:
