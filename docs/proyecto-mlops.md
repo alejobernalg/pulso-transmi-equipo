@@ -164,6 +164,39 @@ positiva (≈ −0,1). Es la firma de un perfil estable más ruido independiente
 lo que funcionó fue estimar mejor el perfil (+0,5 a +0,7 puntos en CV), no añadir lags; quitar
 los lags no ayudó. Es una lectura de los datos, no una garantía: no se conoce el generador.
 
+### 5.5 Cambios de nivel durante la competencia (2026-09-30)
+
+El generador aplica saltos bruscos de nivel por estación. El 16-sep hacia las 9 h Portal
+Américas subió ×2,6, Calle 100 ×2,4 y Portal Suba bajó a ×0,4; Banderas cayó por escalones
+(13-sep y 16-sep) hasta ~×0,2. Esas cuatro estaciones concentraban la pérdida de accuracy
+(79–85 contra 88–89 de las estables).
+
+**Replay en vivo** (`pulso_forecast.replay`): re-simula cada ciclo horario como producción
+(historia hasta el origen, alineación, features, corrección de nivel). Reproduce las
+predicciones realmente enviadas con diferencia máxima de 0,01. Se evaluó en dos ventanas:
+A (orígenes 11..14-sep, modelo con corte 11-sep) y B (14..18-sep, el modelo M7 real).
+
+| Cambio | A | B |
+|---|---:|---:|
+| Producción previa | 84,98 | 86,93 |
+| Detector de quiebre más rápido (reglas sobre residuos) | ≤ +0,06 | ≤ +0,24 |
+| `BREAK_CLIP` (0,3–2,0) → (0,2–3,0) | −0,003 | +0,19 |
+| + `align_level_shifts` (adoptado) | **84,96** | **87,88** |
+
+- El detector más rápido se descartó: con ~12 % de ruido, reaccionar en 1 h dispara falsas
+  alarmas en horas de bajo volumen (hasta −1,5 pts en estaciones estables).
+- `align_level_shifts` detecta quiebres sobre el nivel horario (demanda / perfil previo a la
+  competencia) y reescala la historia anterior al nivel actual, como `align_peak_shifts` hace
+  con el pico. Así el nivel de 7 días, los lags y los perfiles quedan en el régimen nuevo de
+  inmediato. En B: Banderas +8,4, Américas +1,5, Ricaurte +0,9, Suba +0,6, Calle 100 +0,0.
+  En A: −0,02, peor estación estable −0,15 (Calle 72: el corrimiento de picos del 11-sep se
+  parece por unas horas a un cambio de nivel). No cumple estrictamente "mejorar en ambas
+  ventanas"; se adoptó porque la pérdida está al nivel del ruido y la ganancia no.
+- Reentrenar con la historia realineada no cambió el resultado frente a realinear solo al
+  predecir (87,85 vs 87,91); se usa la misma `align_history` en ambos para no divergir.
+- Pendiente: Calle 100 no mejora; su error restante es de forma (el pico de la tarde se
+  amplificó más que el resto del día), no de nivel.
+
 ## 6. Uso del paquete
 
 ```bash
@@ -213,9 +246,16 @@ probar el camino completo sin gastar intentos reales de la competencia.
 1. Si Supabase tiene poca historia (repo de equipo nuevo), hace un bootstrap
    descargando los CSV completos de la API.
 2. Entrena un candidato con `pulso_forecast.run_from_frames`/`train_production_from_frames`
-   y lo compara contra el champion activo por accuracy de validación (tolerancia
-   configurable, `--tolerance`, default 0,5 puntos). Promueve solo si no empeora,
-   o si es el primer modelo.
+   y lo compara contra el champion activo (tolerancia configurable, `--tolerance`,
+   default 0,5 puntos). Promueve solo si no empeora, o si es el primer modelo.
+   Desde 2026-09-30 la comparación es **con la misma información**: la receta
+   candidata (código + hiperparámetros) se reentrena con el mismo corte que el
+   champion y ambos se miden sobre los objetivos posteriores a ese corte (fuera de
+   muestra para ambos, mínimo un día). Antes se comparaba la
+   validación del candidato contra la validación registrada del champion, medida en
+   otra ventana; con drift, la ventana nueva siempre es más difícil y el gate
+   rechazaba candidatos por la fecha, no por mérito (M2 necesitó tolerancia 5,0). Si
+   el champion es demasiado reciente o no se puede cargar, se usa el gate anterior.
 3. Si promueve: sube el `model.joblib` al bucket `models`, inserta `model_versions`
    y desactiva el anterior (`model_versions.is_active` único).
 4. Calcula un chequeo de drift simple: compara la accuracy reciente (uniendo
