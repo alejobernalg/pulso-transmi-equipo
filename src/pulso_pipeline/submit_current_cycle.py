@@ -30,6 +30,7 @@ STEP_MIN = 15
 RETRYABLE_MAX_ATTEMPTS = 3
 CONTEXT_STALE_HOURS = 20.0  # el feed de contexto (clima/eventos) puede atrasarse
 # un poco por su cuenta; más de esto sin filas nuevas es anómalo, no solo lag normal
+COMPETITION_START = datetime(2026, 9, 9, 5, tzinfo=timezone.utc)  # fin de la historia inicial (/v1/meta)
 
 
 def git_commit() -> str | None:
@@ -130,7 +131,14 @@ def check_context_freshness(database, run_id: str) -> None:
     devuelve 0 filas nuevas. Eso pasó realmente: el cursor no avanzó por 3
     días seguidos sin que nada se rompiera ni se viera en ningún lado. Esto
     deja evidencia en `drift_signals` para que sea visible sin tener que
-    comparar cursores a mano."""
+    comparar cursores a mano.
+
+    Excepción: la API no publica contexto durante la competencia (`/v1/context`
+    vacío después de la historia inicial), así que mientras el feed nunca haya
+    pasado de ahí no es un corte sino la regla del reto, y no se alerta."""
+    latest = db.latest_context_at(database)
+    if latest is None or datetime.fromisoformat(latest) < COMPETITION_START:
+        return
     updated_at = db.get_cursor_updated_at(database, "context")
     if updated_at is None:
         return

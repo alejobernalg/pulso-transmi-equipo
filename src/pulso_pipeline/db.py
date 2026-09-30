@@ -60,6 +60,11 @@ def get_cursor_updated_at(db: Client, resource: str) -> str | None:
     return rows[0]["updated_at"] if rows else None
 
 
+def latest_context_at(db: Client) -> str | None:
+    rows = db.table("context").select("observed_at").order("observed_at", desc=True).limit(1).execute().data
+    return rows[0]["observed_at"] if rows else None
+
+
 def set_cursor(db: Client, resource: str, cursor: str | None) -> None:
     db.table("sync_state").upsert(
         {"resource": resource, "cursor": cursor, "updated_at": datetime.now(timezone.utc).isoformat()}

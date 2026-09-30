@@ -119,3 +119,21 @@ def test_same_block_gate_falls_back_when_champion_saw_the_block() -> None:
     few = {"n_targets": tap.SAME_BLOCK_MIN_TARGETS - 1, "model": 87.0, "reference": 86.0}
     assert tap.same_block_accuracies(_report(few)) is None
 
+
+# ------------------------------------------------- alerta de contexto atrasado
+def test_context_alert_skipped_while_context_never_published_in_competition(monkeypatch) -> None:
+    saved = []
+    monkeypatch.setattr(spc.db, "latest_context_at", lambda _db: "2026-09-09T04:45:00+00:00")
+    monkeypatch.setattr(spc.db, "get_cursor_updated_at", lambda _db, _r: "2026-09-01T00:00:00+00:00")
+    monkeypatch.setattr(spc.db, "save_drift_signals", lambda _db, rows: saved.extend(rows))
+    spc.check_context_freshness(object(), "run")
+    assert saved == []
+
+
+def test_context_alert_fires_when_feed_stalls_during_competition(monkeypatch) -> None:
+    saved = []
+    monkeypatch.setattr(spc.db, "latest_context_at", lambda _db: "2026-09-12T00:00:00+00:00")
+    monkeypatch.setattr(spc.db, "get_cursor_updated_at", lambda _db, _r: "2026-09-01T00:00:00+00:00")
+    monkeypatch.setattr(spc.db, "save_drift_signals", lambda _db, rows: saved.extend(rows))
+    spc.check_context_freshness(object(), "run")
+    assert len(saved) == 1 and saved[0]["triggered"] is True
