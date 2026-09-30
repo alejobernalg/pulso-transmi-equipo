@@ -98,3 +98,24 @@ def test_fetch_page_with_retries_raises_after_max_attempts(monkeypatch) -> None:
     with pytest.raises(PulsoTransmiError):
         spc._fetch_page_with_retries(always_fails, cursor=None)
     assert len(calls) == spc.RETRYABLE_MAX_ATTEMPTS
+
+
+# --------------------------------------------------------- gate de promoción
+import pulso_pipeline.train_and_promote as tap  # noqa: E402
+
+
+def _report(same_block):
+    return {"horizons": {f"h{h}": {"model": 85.0, **({"same_block": same_block} if same_block else {})}
+                         for h in (1, 2, 3, 4)}}
+
+
+def test_same_block_gate_uses_both_models_on_the_same_targets() -> None:
+    sb = {"n_targets": 5000, "model": 87.0, "reference": 86.0}
+    assert tap.same_block_accuracies(_report(sb)) == (87.0, 86.0, 5000)
+
+
+def test_same_block_gate_falls_back_when_champion_saw_the_block() -> None:
+    assert tap.same_block_accuracies(_report(None)) is None
+    few = {"n_targets": tap.SAME_BLOCK_MIN_TARGETS - 1, "model": 87.0, "reference": 86.0}
+    assert tap.same_block_accuracies(_report(few)) is None
+

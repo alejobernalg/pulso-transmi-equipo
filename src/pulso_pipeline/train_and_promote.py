@@ -13,8 +13,10 @@ import json
 import sys
 import tempfile
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
+import joblib
 import pandas as pd
 
 from pulso_forecast import (
@@ -34,6 +36,7 @@ from .submit_current_cycle import git_commit
 MIN_BOOTSTRAP_ROWS = 40_000
 DRIFT_THRESHOLD_POINTS = 5.0
 DRIFT_MIN_SAMPLES = 20
+SAME_BLOCK_MIN_TARGETS = 12 * 96  # un día de objetivos por estación
 
 
 def ensure_bootstrapped(client: PulsoTransmiClient, database) -> None:
@@ -81,6 +84,32 @@ def champion_baseline_accuracy(database, model_id: str) -> float | None:
     if not rows:
         return None
     return float(pd.Series([r["value"] for r in rows]).mean())
+
+
+def load_reference(database, champion: dict | None) -> dict | None:
+    """Modelos del champion para medirlo en el mismo bloque que el candidato. Si no
+    se puede cargar, se vuelve al gate por accuracy de validación registrada."""
+    if champion is None:
+        return None
+    try:
+        bundle = joblib.load(BytesIO(db.download_model(database, champion["artifact_uri"])))
+        return {"models": bundle["models"], "train_cutoff": bundle["meta"]["data_cutoff"]}
+    except Exception as exc:  # noqa: BLE001 - el gate de respaldo sigue funcionando
+        print(f"aviso: no se pudo cargar el champion para comparar en el mismo bloque ({exc})")
+        return None
+
+
+def same_block_accuracies(report: dict) -> tuple[float, float, int] | None:
+    """(candidato, champion, objetivos) promediados por horizonte: la receta candidata
+    reentrenada con el corte del champion y ambos medidos en los objetivos posteriores
+    a ese corte. None si algún horizonte no tiene al menos `SAME_BLOCK_MIN_TARGETS`
+    objetivos (champion demasiado reciente para compararlo fuera de muestra)."""
+    rows = [report["horizons"][f"h{h}"].get("same_block") for h in HORIZONS]
+    if any(r is None or r["n_targets"] < SAME_BLOCK_MIN_TARGETS for r in rows):
+        return None
+    return (float(pd.Series([r["model"] for r in rows]).mean()),
+            float(pd.Series([r["reference"] for r in rows]).mean()),
+            min(r["n_targets"] for r in rows))
 
 
 def check_drift(database, active_model_id: str, baseline_accuracy: float | None, run_id: str) -> None:
@@ -168,18 +197,25 @@ def main(argv: list[str] | None = None) -> int:
             obs_df, ctx_df, stations_df = db.fetch_history(database)
             y, ctx, stations = wide_from_frames(obs_df, ctx_df, stations_df)
 
+            champion = db.get_active_model(database)
+            champion_accuracy = champion_baseline_accuracy(database, champion["model_id"]) if champion else None
+            reference = load_reference(database, champion)
+
             with tempfile.TemporaryDirectory() as tmp:
-                report = run_from_frames(y, ctx, stations, Path(tmp), horizons=HORIZONS)
+                report = run_from_frames(y, ctx, stations, Path(tmp), horizons=HORIZONS, reference=reference)
 
             candidate_accuracy = float(pd.Series(
                 [report["horizons"][f"h{h}"]["model"] for h in HORIZONS]
             ).mean())
-
-            champion = db.get_active_model(database)
-            champion_accuracy = champion_baseline_accuracy(database, champion["model_id"]) if champion else None
+            same_block = same_block_accuracies(report)
 
             if champion is None:
                 promote, reason = True, "bootstrap: primer modelo activo"
+            elif same_block is not None:
+                cand, champ, n = same_block
+                promote = cand >= champ - args.tolerance
+                reason = (f"mismo bloque ({n} objetivos): candidato {cand:.2f} vs champion {champ:.2f} "
+                          f"(tolerancia {args.tolerance})")
             elif champion_accuracy is None:
                 promote, reason = True, "champion activo sin métricas de validación registradas"
             elif candidate_accuracy >= champion_accuracy - args.tolerance:
