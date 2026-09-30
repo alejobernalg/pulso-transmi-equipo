@@ -262,6 +262,14 @@ probar el camino completo sin gastar intentos reales de la competencia.
    `predictions` ya entregadas con `observations` ya liberadas) contra la accuracy
    de validación del champion; si la caída supera 5 puntos, marca `drift_signals.triggered`.
    Es una heurística honesta, no un detector multivariado (PSI) completo.
+5. Registra la corrida en **MLflow** (servidor de DagsHub, `pulso_pipeline.tracking`):
+   parámetros, métricas de validación por horizonte y estación, comparación contra el
+   champion, commit y cortes. Si promueve, sube `model.joblib`, crea una versión de
+   `pulso-forecast` en el Model Registry y le mueve el alias `champion`. Es un espejo
+   para trazabilidad: el pipeline de predicción sigue leyendo el modelo de Supabase, y
+   si MLflow falla solo se avisa. Se activa con la variable `DAGSHUB_USER` y el secret
+   `DAGSHUB_TOKEN` del repo; los modelos anteriores se cargaron con
+   `python -m pulso_pipeline.backfill_mlflow` (idempotente).
 
 El cron de `predict.yml` está activo en el archivo tal como lo recomienda la guía,
 pero **no corre en ningún lado hasta hacer push** a un repositorio de GitHub con los

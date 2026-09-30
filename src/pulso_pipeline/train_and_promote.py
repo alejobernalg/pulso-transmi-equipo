@@ -30,7 +30,7 @@ from pulso_forecast import (
 )
 from pulso_transmi import PulsoTransmiClient
 
-from . import db
+from . import db, tracking
 from .submit_current_cycle import git_commit
 
 MIN_BOOTSTRAP_ROWS = 40_000
@@ -276,6 +276,15 @@ def main(argv: list[str] | None = None) -> int:
                 db.save_metrics(database, metric_rows)
                 db.promote_model(database, model_id)
                 print(f"promovido: {version} ({model_id})")
+                tracking.log_training(
+                    report=report, params_by_h=params_by_h, version=version, decision="retrain", reason=reason,
+                    git_commit=commit, data_cutoff=str(y.index[-1]),
+                    train_cutoff=str(y.index[production_train_end(len(y))]), supabase_model_id=model_id,
+                    joblib_bytes=joblib_bytes, promote=True)
+            else:
+                tracking.log_training(
+                    report=report, params_by_h={h: report["horizons"][f"h{h}"]["best_params"] for h in HORIZONS},
+                    version=None, decision="keep", reason=reason, git_commit=commit, data_cutoff=str(y.index[-1]))
 
             if champion is not None:
                 check_drift(database, champion["model_id"], champion_accuracy, run_id)

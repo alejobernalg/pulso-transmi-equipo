@@ -137,3 +137,31 @@ def test_context_alert_fires_when_feed_stalls_during_competition(monkeypatch) ->
     monkeypatch.setattr(spc.db, "save_drift_signals", lambda _db, rows: saved.extend(rows))
     spc.check_context_freshness(object(), "run")
     assert len(saved) == 1 and saved[0]["triggered"] is True
+
+
+# ------------------------------------------------------------------ MLflow
+import pulso_pipeline.tracking as tracking  # noqa: E402
+
+
+def test_tracking_is_a_no_op_without_server(monkeypatch) -> None:
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    assert tracking.log_training(report=None, params_by_h=None, version="v", decision="keep", reason="",
+                                 git_commit="x", data_cutoff="c", joblib_bytes=b"model") is None
+
+
+def test_tracking_failure_never_breaks_training(monkeypatch) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:9")  # nadie escucha
+    monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "0")
+    monkeypatch.setenv("MLFLOW_HTTP_REQUEST_TIMEOUT", "1")
+    assert tracking.log_training(report=None, params_by_h=None, version="v", decision="keep", reason="",
+                                 git_commit="x", data_cutoff="c") is None
+
+
+def test_tracking_flattens_params_and_metrics() -> None:
+    params = tracking._flat_params({1: {"hgb": {"learning_rate": 0.05}, "w_hgb": 0.6}})
+    assert params == {"h1.hgb.learning_rate": 0.05, "h1.w_hgb": 0.6}
+    report = {"horizons": {"h1": {"model": 88.0, "por_estacion": {"02300": 86.5},
+                                  "same_block": {"model": 87.5, "reference": 87.7}},
+                           "h2": {"model": 86.0}}}
+    m = tracking._metrics(report)
+    assert m["accuracy"] == 87.0 and m["h1.station_02300"] == 86.5 and m["h1.same_block.champion"] == 87.7

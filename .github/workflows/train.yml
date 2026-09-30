@@ -41,5 +41,10 @@ jobs:
           PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # MLflow en DagsHub (opcional: sin la variable DAGSHUB_USER no se registra nada)
+          MLFLOW_TRACKING_URI: ${{ vars.DAGSHUB_USER && format('https://dagshub.com/{0}/pulso-transmi-equipo.mlflow', vars.DAGSHUB_USER) || '' }}
+          MLFLOW_TRACKING_USERNAME: ${{ vars.DAGSHUB_USER }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.DAGSHUB_TOKEN }}
+          MLFLOW_DISABLE_AGENT_HINT: "1"
         run: |
           python -m pulso_pipeline.train_and_promote ${{ inputs.dry_run && '--dry-run' || '' }} --tolerance ${{ inputs.tolerance }}
