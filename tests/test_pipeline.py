@@ -201,3 +201,13 @@ def test_decide_promotes_keeps_and_rolls_back() -> None:
     assert sh.decide(82.0, 80.0, shadow_is_previous_champion=False) == ("discard", "rejected")
     assert sh.decide(80.0, 82.0, shadow_is_previous_champion=True) == ("promote", "rejected")
     assert sh.decide(82.0, 80.0, shadow_is_previous_champion=True) == ("discard", "retired")
+
+
+def test_wait_for_cutoff_resyncs_until_data_arrives(monkeypatch) -> None:
+    latest = iter(["2026-09-18T09:30:00+00:00", "2026-09-18T09:45:00+00:00", "2026-09-18T10:00:00+00:00"])
+    syncs = []
+    monkeypatch.setattr(spc.db, "latest_observation_at", lambda _db: next(latest))
+    monkeypatch.setattr(spc, "sync_observations", lambda _c, _d: syncs.append(1))
+    monkeypatch.setattr(spc.time, "sleep", lambda _: None)
+    spc.wait_for_cutoff(object(), object(), "2026-09-18T10:00:00Z")
+    assert len(syncs) == 2

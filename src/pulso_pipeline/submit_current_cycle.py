@@ -168,6 +168,27 @@ CYCLE_WAIT_SECONDS = 180
 CYCLE_POLL_SECONDS = 30
 
 
+CUTOFF_WAIT_SECONDS = 240
+CUTOFF_POLL_SECONDS = 20
+
+
+def wait_for_cutoff(client: PulsoTransmiClient, database, cutoff: str) -> None:
+    """El ciclo puede abrir unos segundos antes de que el stream libere las observaciones
+    de su `data_cutoff`; antes la corrida fallaba ("origin no coincide") y el ciclo quedaba
+    para la siguiente, 5 minutos después. Ahora se re-sincroniza hasta que lleguen."""
+    target = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    deadline = time.monotonic() + CUTOFF_WAIT_SECONDS
+    while True:
+        latest = db.latest_observation_at(database)
+        if latest is not None and datetime.fromisoformat(latest) >= target:
+            return
+        if time.monotonic() >= deadline:
+            return  # forecast_for_targets falla con un mensaje claro; la siguiente corrida reintenta
+        print(f"esperando observaciones hasta {cutoff} (último dato {latest})")
+        time.sleep(CUTOFF_POLL_SECONDS)
+        sync_observations(client, database)
+
+
 def _wait_for_cycle(client: PulsoTransmiClient):
     cycle = client.current_cycle()
     if cycle is not None or datetime.now(timezone.utc).minute not in CYCLE_OPEN_MINUTES:
@@ -221,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
 
             bundle = joblib.load(BytesIO(db.download_model(database, model_row["artifact_uri"])))
 
+            wait_for_cutoff(client, database, cycle["data_cutoff"])
             obs_df, ctx_df, stations_df = db.fetch_history(database)
             y, ctx, stations = wide_from_frames(obs_df, ctx_df, stations_df)
             cutoff = cycle["data_cutoff"]
