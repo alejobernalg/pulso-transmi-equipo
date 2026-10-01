@@ -28,6 +28,7 @@ from pulso_forecast import (
     train_production_from_frames,
     wide_from_frames,
 )
+from pulso_forecast.model import RECIPES
 from pulso_transmi import PulsoTransmiClient
 
 from . import db, shadow, tracking
@@ -180,6 +181,51 @@ def check_drift(database, active_model_id: str, baseline_accuracy: float | None,
     db.save_metrics(database, metric_rows)
 
 
+def register_model(database, *, y, ctx, stations, report: dict, params_by_h: dict, recipe: str, version: str,
+                   run_id: str, commit: str, reason: str, parent_model_id: str | None, champion: bool = False) -> str:
+    """Entrena una receta con todos los datos, la sube al bucket, la registra en
+    `model_versions` (inactiva), guarda sus métricas de validación y la espeja en MLflow."""
+    with tempfile.TemporaryDirectory() as tmp:
+        train_production_from_frames(y, ctx, stations, Path(tmp), params_by_h, horizons=HORIZONS, recipe=recipe)
+        joblib_bytes = (Path(tmp) / "model.joblib").read_bytes()
+    sample_features = sorted(feature_columns(make_frame(y, ctx, stations, HORIZONS[0])))
+    train_cutoff = str(y.index[production_train_end(len(y))])
+    model_id = db.insert_model_version(
+        database,
+        version=version,
+        trained_in_run_id=run_id,
+        parent_model_id=parent_model_id,
+        git_commit=commit,
+        algorithm="HGB+LightGBM blend" if recipe == "base" else f"HGB+LightGBM blend ({recipe})",
+        params={str(h): p for h, p in params_by_h.items()},
+        feature_list=sample_features,
+        features_hash=hashlib.sha256(json.dumps(sample_features).encode()).hexdigest(),
+        train_cutoff=train_cutoff,
+        artifact_uri=db.upload_model(database, version, joblib_bytes),
+        retrain_reason=reason,
+        is_active=False,
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    metric_rows = []
+    for h in HORIZONS:  # validación de la receta base (las variantes las decide la sombra)
+        row = report["horizons"][f"h{h}"]
+        metric_rows.append({
+            "run_id": run_id, "model_id": model_id, "station_id": None, "split": "validation",
+            "metric_name": "accuracy", "window_label": f"h{h}", "value": row["model"], "computed_at": now,
+        })
+        for station_id, acc in row["por_estacion"].items():
+            metric_rows.append({
+                "run_id": run_id, "model_id": model_id, "station_id": station_id, "split": "validation",
+                "metric_name": "accuracy", "window_label": f"h{h}", "value": acc, "computed_at": now,
+            })
+    db.save_metrics(database, metric_rows)
+    tracking.log_training(
+        report=report, params_by_h=params_by_h, version=version, decision="retrain", reason=f"{recipe}: {reason}",
+        git_commit=commit, data_cutoff=str(y.index[-1]), train_cutoff=train_cutoff, supabase_model_id=model_id,
+        joblib_bytes=joblib_bytes, promote=champion)
+    return model_id
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="evalúa y decide, no escribe en Supabase")
@@ -246,56 +292,23 @@ def main(argv: list[str] | None = None) -> int:
 
             if promote:
                 params_by_h = {h: report["horizons"][f"h{h}"]["best_params"] for h in HORIZONS}
-                with tempfile.TemporaryDirectory() as tmp:
-                    train_production_from_frames(y, ctx, stations, Path(tmp), params_by_h, horizons=HORIZONS)
-                    joblib_bytes = (Path(tmp) / "model.joblib").read_bytes()
-
-                sample_features = sorted(feature_columns(make_frame(y, ctx, stations, HORIZONS[0])))
-                features_hash = hashlib.sha256(json.dumps(sample_features).encode()).hexdigest()
-                version = f"pulso-forecast-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-                artifact_uri = db.upload_model(database, version, joblib_bytes)
-
-                model_id = db.insert_model_version(
-                    database,
-                    version=version,
-                    trained_in_run_id=run_id,
-                    parent_model_id=champion["model_id"] if champion else None,
-                    git_commit=commit,
-                    algorithm="HGB+LightGBM blend",
-                    params={str(h): p for h, p in params_by_h.items()},
-                    feature_list=sample_features,
-                    features_hash=features_hash,
-                    train_cutoff=str(y.index[production_train_end(len(y))]),
-                    artifact_uri=artifact_uri,
-                    retrain_reason=reason,
-                    is_active=False,
-                )
-
-                now = datetime.now(timezone.utc).isoformat()
-                metric_rows = []
-                for h in HORIZONS:
-                    row = report["horizons"][f"h{h}"]
-                    metric_rows.append({
-                        "run_id": run_id, "model_id": model_id, "station_id": None, "split": "validation",
-                        "metric_name": "accuracy", "window_label": f"h{h}", "value": row["model"], "computed_at": now,
-                    })
-                    for station_id, acc in row["por_estacion"].items():
-                        metric_rows.append({
-                            "run_id": run_id, "model_id": model_id, "station_id": station_id, "split": "validation",
-                            "metric_name": "accuracy", "window_label": f"h{h}", "value": acc, "computed_at": now,
-                        })
-                db.save_metrics(database, metric_rows)
-                if args.mode == "shadow":
-                    db.set_stage(database, model_id, "shadow")
-                    print(f"en sombra: {version} ({model_id})")
-                else:
-                    db.promote_model(database, model_id)
-                    print(f"promovido: {version} ({model_id})")
-                tracking.log_training(
-                    report=report, params_by_h=params_by_h, version=version, decision="retrain", reason=reason,
-                    git_commit=commit, data_cutoff=str(y.index[-1]),
-                    train_cutoff=str(y.index[production_train_end(len(y))]), supabase_model_id=model_id,
-                    joblib_bytes=joblib_bytes, promote=args.mode == "promote")
+                stamp = f"pulso-forecast-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+                # en sombra compiten varias recetas (base, peso a lo reciente, ventana reciente);
+                # en promoción directa se usa solo la base
+                recipes = list(RECIPES) if args.mode == "shadow" else ["base"]
+                for recipe in recipes:
+                    version = stamp if recipe == "base" else f"{stamp}-{recipe}"
+                    model_id = register_model(
+                        database, y=y, ctx=ctx, stations=stations, report=report, params_by_h=params_by_h,
+                        recipe=recipe, version=version, run_id=run_id, commit=commit, reason=reason,
+                        parent_model_id=champion["model_id"] if champion else None,
+                        champion=args.mode == "promote")
+                    if args.mode == "shadow":
+                        db.set_stage(database, model_id, "shadow")
+                        print(f"en sombra: {version} ({model_id})")
+                    else:
+                        db.promote_model(database, model_id)
+                        print(f"promovido: {version} ({model_id})")
             else:
                 tracking.log_training(
                     report=report, params_by_h={h: report["horizons"][f"h{h}"]["best_params"] for h in HORIZONS},

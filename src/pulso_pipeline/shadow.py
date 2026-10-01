@@ -113,44 +113,54 @@ def _challenge_frame(database, champion: dict, shadow: dict) -> pd.DataFrame:
 
 
 def evaluate_shadow(database) -> str | None:
-    """Promueve, revierte o descarta el modelo en sombra si ya hay suficientes ciclos."""
-    shadow, champion = db.get_shadow_model(database), db.get_active_model(database)
-    if shadow is None or champion is None:
+    """Con `SHADOW_CYCLES` ciclos observados en todos los modelos en sombra, promueve al mejor
+    si le gana al champion (o revierte, si es el champion anterior); el resto se descarta."""
+    shadows, champion = db.get_shadow_models(database), db.get_active_model(database)
+    if not shadows or champion is None:
         return None
-    frame = _challenge_frame(database, champion, shadow)
-    n_cycles = frame["cycle_id"].nunique() if not frame.empty else 0
-    if n_cycles < SHADOW_CYCLES:
-        print(f"sombra {shadow['version']}: {n_cycles}/{SHADOW_CYCLES} ciclos observados")
-        return None
-    champ_acc, shadow_acc = challenge_accuracy(frame)
-    previous = pd.Timestamp(shadow["created_at"]) < pd.Timestamp(champion["created_at"])
+    results = []
+    for sh_model in shadows:
+        frame = _challenge_frame(database, champion, sh_model)
+        n = frame["cycle_id"].nunique() if not frame.empty else 0
+        if n < SHADOW_CYCLES:
+            print(f"sombra {sh_model['version']}: {n}/{SHADOW_CYCLES} ciclos observados")
+            return None
+        champ_acc, shadow_acc = challenge_accuracy(frame)
+        results.append((shadow_acc - champ_acc, champ_acc, shadow_acc, n, sh_model))
+    _, champ_acc, shadow_acc, n, best = max(results, key=lambda r: r[0])
+    previous = pd.Timestamp(best["created_at"]) < pd.Timestamp(champion["created_at"])
     action, loser_stage = decide(champ_acc, shadow_acc, previous)
-    summary = (f"sombra {shadow['version']} {shadow_acc:.2f} vs champion {champion['version']} "
-               f"{champ_acc:.2f} en {n_cycles} ciclos")
+    others = ", ".join(f"{r[4]['version']} {r[2]:.2f}" for r in results if r[4] is not best)
+    summary = (f"mejor sombra {best['version']} {shadow_acc:.2f} vs champion {champion['version']} "
+               f"{champ_acc:.2f} en {n} ciclos" + (f" (otras: {others})" if others else ""))
+    for r in results:
+        if r[4] is not best:
+            db.set_stage(database, r[4]["model_id"], "rejected")
     if action == "promote":
-        db.promote_model(database, shadow["model_id"], previous_stage=loser_stage)
+        db.promote_model(database, best["model_id"], previous_stage=loser_stage)
         print(f"{'reversión' if previous else 'promoción'}: {summary}")
     else:
-        db.set_stage(database, shadow["model_id"], loser_stage)
+        db.set_stage(database, best["model_id"], loser_stage)
         print(f"se conserva el champion: {summary}")
     return f"{action}: {summary}"
 
 
 # ------------------------------------------------------------ predicción en sombra
-def predict_shadow(database, cycle: dict, y, ctx, stations, targets: list, champion_id: str) -> None:
-    shadow = db.get_shadow_model(database)
-    if shadow is None or shadow["model_id"] == champion_id:
-        return
-    bundle = joblib.load(BytesIO(db.download_model(database, shadow["artifact_uri"])))
-    preds = forecast_for_targets(bundle["models"], y, ctx, stations, cycle["data_cutoff"], targets,
-                                 train_cutoff=bundle["meta"].get("data_cutoff"))
-    db.save_shadow_predictions(database, [
-        {"cycle_id": cycle["cycle_id"], "model_id": shadow["model_id"], "station_id": r.station_id,
-         "target_at": r.target_at.isoformat(), "horizon_steps": int(r.horizon_steps), "y_pred": float(r.value),
-         "issued_at": cycle["data_cutoff"]}
-        for r in preds.itertuples()
-    ])
-    print(f"sombra {shadow['version']}: {len(preds)} predicciones guardadas (no enviadas)")
+def predict_shadow(database, cycle: dict, y, ctx, stations, targets: list, champion_id: str,
+                   policy: dict | None = None) -> None:
+    for sh_model in db.get_shadow_models(database):
+        if sh_model["model_id"] == champion_id:
+            continue
+        bundle = joblib.load(BytesIO(db.download_model(database, sh_model["artifact_uri"])))
+        preds = forecast_for_targets(bundle["models"], y, ctx, stations, cycle["data_cutoff"], targets,
+                                     train_cutoff=bundle["meta"].get("data_cutoff"), policy=policy)
+        db.save_shadow_predictions(database, [
+            {"cycle_id": cycle["cycle_id"], "model_id": sh_model["model_id"], "station_id": r.station_id,
+             "target_at": r.target_at.isoformat(), "horizon_steps": int(r.horizon_steps), "y_pred": float(r.value),
+             "issued_at": cycle["data_cutoff"]}
+            for r in preds.itertuples()
+        ])
+        print(f"sombra {sh_model['version']}: {len(preds)} predicciones guardadas (no enviadas)")
 
 
 # ------------------------------------------------------------ disparador
@@ -217,7 +227,7 @@ def main() -> int:
     reasons = drift_reasons(rank_c, rank_r, recent_cycle_accuracies(database), baseline)
     last = db.last_retrain_trigger_at(database)
     now = datetime.now(timezone.utc)
-    trigger, reason = should_trigger(reasons, db.get_shadow_model(database) is not None,
+    trigger, reason = should_trigger(reasons, bool(db.get_shadow_models(database)),
                                      datetime.fromisoformat(last) if last else None, now)
     if trigger:
         dispatch_training()

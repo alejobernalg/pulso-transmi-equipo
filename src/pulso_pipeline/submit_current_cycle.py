@@ -22,9 +22,10 @@ from io import BytesIO
 import joblib
 
 from pulso_forecast import forecast_for_targets, wide_from_frames
+from pulso_forecast.model import DEFAULT_POLICY_NAME, POLICIES
 from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient, PulsoTransmiError
 
-from . import db, shadow
+from . import db, policy, shadow
 
 STEP_MIN = 15
 RETRYABLE_MAX_ATTEMPTS = 3
@@ -154,6 +155,10 @@ def check_context_freshness(database, run_id: str) -> None:
     }])
 
 
+def _num(v: float) -> float | None:
+    return None if v is None or not math.isfinite(v) else float(v)
+
+
 def _predictions_hash(payload: list[dict]) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
@@ -250,8 +255,14 @@ def main(argv: list[str] | None = None) -> int:
             ctx = ctx.loc[:cutoff]
 
             targets = [(t["station_id"], t["target_at"]) for t in cycle["targets"]]
+            try:  # política de corrección según el desempeño reciente (pulso_pipeline.policy)
+                policy_name, policy_reason = policy.select_policy(database, model_row["model_id"])
+            except Exception as exc:  # noqa: BLE001 - ante cualquier duda, la estándar
+                policy_name, policy_reason = DEFAULT_POLICY_NAME, f"estándar (no se pudo evaluar: {exc})"
+            print(f"política: {policy_reason}")
             preds = forecast_for_targets(bundle["models"], y, ctx, stations, cutoff, targets,
-                                         train_cutoff=bundle["meta"].get("data_cutoff"))
+                                         train_cutoff=bundle["meta"].get("data_cutoff"),
+                                         policy=POLICIES[policy_name])
 
             if len(preds) != cycle["expected_predictions"]:
                 raise ValueError(
@@ -352,11 +363,22 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 for r in preds.itertuples()
             ])
+            try:  # componentes para que el selector de política pueda recalcular este ciclo
+                db.save_prediction_components(database, [
+                    {"cycle_id": cycle["cycle_id"], "model_id": model_row["model_id"], "station_id": r.station_id,
+                     "target_at": r.target_at.isoformat(), "horizon_steps": int(r.horizon_steps),
+                     "base": float(r.base), "r_own": _num(r.r_own), "r_common": _num(r.r_common),
+                     "r_now": _num(r.r_now), "policy": policy_name}
+                    for r in preds.itertuples()
+                ])
+            except Exception as exc:  # noqa: BLE001
+                print(f"aviso: no se pudieron guardar los componentes ({exc})")
             db.finish_run(database, run_id, status="success", decision="keep",
-                          decision_reason="submitted", data_cutoff=cutoff)
+                          decision_reason=f"submitted | política {policy_name}", data_cutoff=cutoff)
             print(f"entregado: {cycle['cycle_id']} -> {receipt.get('submission_id')}")
             try:  # el modelo en sombra predice el mismo ciclo, sin enviar
-                shadow.predict_shadow(database, cycle, y, ctx, stations, targets, model_row["model_id"])
+                shadow.predict_shadow(database, cycle, y, ctx, stations, targets, model_row["model_id"],
+                                      POLICIES[policy_name])
             except Exception as exc:  # noqa: BLE001
                 print(f"aviso: no se pudo predecir con el modelo en sombra ({exc})")
             return 0

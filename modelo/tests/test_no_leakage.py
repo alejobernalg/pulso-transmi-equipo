@@ -108,3 +108,16 @@ def test_night_surge_is_not_a_level_shift(monkeypatch):
     y2.loc[night, y.columns[0]] *= 4
     assert pm.detect_level_shifts(y2.loc[: y.index[night][-1]]) == {}
 
+
+
+def test_recipes_only_reweight_or_trim_the_past():
+    h, train_end = 1, 3000
+    frame = pm.make_frame(y, ctx, stations, h)
+    tr, _ = pm.split_by_target(frame, h, train_end=train_end, val=None)
+    base, w = pm.recipe_rows(tr, h, train_end, "base")
+    assert w is None and len(base) == len(tr)
+    rec, w = pm.recipe_rows(tr, h, train_end, "reciente")
+    assert len(rec) == len(tr) and w.max() == 1.0 and (w > 0).all()
+    win, w = pm.recipe_rows(tr, h, train_end, "ventana14")
+    assert w is None and 0 < len(win) < len(tr)
+    assert ((win["_t"] + h) > train_end - 14 * pm.DAY).all() and ((win["_t"] + h) <= train_end).all()

@@ -163,15 +163,23 @@ def validation_accuracy(db: Client, model_id: str) -> float | None:
     return sum(r["value"] for r in rows) / len(rows) if rows else None
 
 
+def get_shadow_models(db: Client) -> list[dict[str, Any]]:
+    return db.table("model_versions").select("*").eq("stage", "shadow").order("created_at").execute().data
+
+
 def get_shadow_model(db: Client) -> dict[str, Any] | None:
-    rows = db.table("model_versions").select("*").eq("stage", "shadow").order("stage_changed_at", desc=True) \
-        .limit(1).execute().data
-    return rows[0] if rows else None
+    rows = get_shadow_models(db)
+    return rows[-1] if rows else None
 
 
 def save_shadow_predictions(db: Client, rows: list[dict]) -> None:
     if rows:
         db.table("shadow_predictions").upsert(rows, on_conflict="cycle_id,model_id,station_id,target_at").execute()
+
+
+def save_prediction_components(db: Client, rows: list[dict]) -> None:
+    if rows:
+        db.table("prediction_components").upsert(rows, on_conflict="cycle_id,model_id,station_id,target_at").execute()
 
 
 def save_leaderboard_snapshot(db: Client, row: dict[str, Any]) -> None:

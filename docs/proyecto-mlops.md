@@ -285,6 +285,18 @@ probar el camino completo sin gastar intentos reales de la competencia.
    reto. Si la sombra gana se promueve y el champion anterior pasa a sombra; si en sus 4
    ciclos vuelve a ganar, se revierte. Ninguna de estas etapas bloquea la entrega.
 
+Cuando se dispara, se entrenan **tres recetas** que compiten en sombra a la vez
+(`RECIPES`): la base, una con peso exponencial a lo reciente (vida media 7 días) y una
+solo con los últimos 14 días. Tras 4 ciclos se promueve la mejor, solo si supera al
+champion.
+
+**Política de corrección adaptativa** (`pulso_pipeline.policy`): cada predicción enviada
+guarda sus componentes (`prediction_components`: base del modelo y razones crudas de la
+corrección). Antes de cada ciclo se recalcula qué habría dado cada política de `POLICIES`
+(estándar, reactiva, tranquila, nowcast) en los últimos 6 ciclos observados, y se usa la
+mejor solo si supera a la estándar por 0,5 puntos. Simulado en el replay: +0,37 en las
+oleadas del 18-sep, neutral (±0,04) en días normales.
+
 Por qué en sombra y no con la validación offline: con drift, la ventana de validación más
 reciente siempre es más difícil, y un champion recién entrenado no tiene un día de datos
 posteriores para compararlo fuera de muestra. El desempeño en vivo, en los mismos ciclos,

@@ -96,26 +96,32 @@ def apply_rule(preds: pd.DataFrame, resid: pd.DataFrame, rule: Callable[[pd.Data
     return out
 
 
-def common_factors(resid: pd.DataFrame) -> pd.Series:
-    """Factor común de `recent_bias_factors` por (origen, horizonte): mediana entre estaciones
-    de sum(y)/sum(p) en los últimos `COMMON_WINDOW` objetivos, aplicada a medias."""
-    w = resid[resid["age"] <= M.COMMON_WINDOW]
-    g = w.groupby(["origin", "h", "station_id"])
-    sums = g[["y", "p"]].sum()[(g.size() == M.COMMON_WINDOW) & (g["p"].sum() > 0)]
-    med = (sums["y"] / sums["p"]).groupby(level=["origin", "h"]).median()
-    return (1 + M.COMMON_SHRINK * (med.clip(*M.COMMON_CLIP) - 1)).rename("common")
-
-
-def apply_production(preds: pd.DataFrame, resid: pd.DataFrame) -> pd.DataFrame:
-    """Réplica completa de `forecast_for_targets`: corrección por estación x factor común x nowcast."""
-    out = apply_rule(preds, resid, production_rule).join(common_factors(resid), on=["origin", "h"])
-    out["factor"] = out["factor"] * out["common"].fillna(1.0)
+def correction_components(preds: pd.DataFrame, resid: pd.DataFrame) -> pd.DataFrame:
+    """`preds` con las razones crudas de la corrección (r_own, r_common, r_now), calculadas
+    igual que `correction_ratios` y `nowcast_ratios` en producción."""
+    keys = ["origin", "station_id", "h"]
+    w = resid[resid["age"] <= M.BIAS_WINDOW].groupby(keys)
+    s = w[["y", "p"]].sum()[(w.size() == M.BIAS_WINDOW) & (w["p"].sum() > 0)]
+    own = (s["y"] / s["p"]).rename("r_own")
+    w = resid[resid["age"] <= M.COMMON_WINDOW].groupby(keys)
+    s = w[["y", "p"]].sum()[(w.size() == M.COMMON_WINDOW) & (w["p"].sum() > 0)]
+    common = (s["y"] / s["p"]).groupby(level=["origin", "h"]).median().rename("r_common")
     x = resid[(resid["h"] == 1) & (resid["age"] <= M.NOWCAST_WINDOW)].groupby(["origin", "station_id"])[["y", "p"]].sum()
-    now = (x["y"] / x["p"].where(x["p"] > 0)).clip(*M.NOWCAST_CLIP).rename("now")
-    out = out.join(now, on=["origin", "station_id"])
-    expo = out["h"].map(M.NOWCAST_DECAY).fillna(0.0) * M.NOWCAST_STRENGTH
-    out["pred"] = out["base"] * out["factor"] * (out["now"] / out["factor"]).pow(expo).fillna(1.0)
+    now = (x["y"] / x["p"].where(x["p"] > 0)).clip(*M.NOWCAST_CLIP).rename("r_now")
+    return (preds.join(own, on=keys).join(common, on=["origin", "h"])
+            .join(now, on=["origin", "station_id"]))
+
+
+def apply_policy(comp: pd.DataFrame, policy: dict | None = None) -> pd.DataFrame:
+    """Predicción final para una política de corrección (ver `policy_factor`)."""
+    out = comp.copy()
+    out["pred"] = out["base"] * M.policy_factor(out["r_own"], out["r_common"], out["r_now"], out["h"], policy)
     return out
+
+
+def apply_production(preds: pd.DataFrame, resid: pd.DataFrame, policy: dict | None = None) -> pd.DataFrame:
+    """Réplica completa de `forecast_for_targets`."""
+    return apply_policy(correction_components(preds, resid), policy)
 
 
 def station_accuracy(scored: pd.DataFrame, col: str = "pred") -> pd.Series:

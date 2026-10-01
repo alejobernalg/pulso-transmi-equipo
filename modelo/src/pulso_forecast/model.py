@@ -392,7 +392,7 @@ def split_by_target(frame: pd.DataFrame, h: int, train_end: int, val: tuple[int,
     return train, valid
 
 
-def _fit_hgb(train: pd.DataFrame, params: dict) -> HistGradientBoostingRegressor:
+def _fit_hgb(train: pd.DataFrame, params: dict, sample_weight=None) -> HistGradientBoostingRegressor:
     """Se probó reemplazar esto por XGBoost (ganaba por 0.07 pts en un dataset
     más chico), pero al reevaluar en el dataset en vivo, más grande, HGB volvió
     a ganar por 1.43 pts en los 4 horizontes (86.92 vs 85.49) -- la ventaja de
@@ -400,13 +400,14 @@ def _fit_hgb(train: pd.DataFrame, params: dict) -> HistGradientBoostingRegressor
     una de las dos patas del blend (ver `fit`)."""
     model = HistGradientBoostingRegressor(
         loss="absolute_error", categorical_features="from_dtype", random_state=0, **params)
-    model.fit(train[feature_columns(train)], train["_ratio"])
+    model.fit(train[feature_columns(train)], train["_ratio"], sample_weight=sample_weight)
     return model
 
 
-def _fit_lgb(train: pd.DataFrame, params: dict) -> LGBMRegressor:
+def _fit_lgb(train: pd.DataFrame, params: dict, sample_weight=None) -> LGBMRegressor:
     model = LGBMRegressor(objective="regression_l1", random_state=0, verbosity=-1, **params)
-    model.fit(train[feature_columns(train)], train["_ratio"])  # categorical_feature="auto" detecta "station"
+    # categorical_feature="auto" detecta "station"
+    model.fit(train[feature_columns(train)], train["_ratio"], sample_weight=sample_weight)
     return model
 
 
@@ -419,7 +420,7 @@ class BlendedModel:
         self.hgb, self.lgb, self.w_hgb = hgb, lgb, w_hgb
 
 
-def fit(train: pd.DataFrame, params: dict) -> BlendedModel:
+def fit(train: pd.DataFrame, params: dict, sample_weight=None) -> BlendedModel:
     """Stacking simple HGB + LightGBM. `params` = {"hgb": {...}, "lgb": {...},
     "w_hgb": float}. Se probaron 9 alternativas de modelo único (XGBoost,
     RandomForest, ExtraTrees, GradientBoosting clásico, LightGBM solo,
@@ -427,7 +428,8 @@ def fit(train: pd.DataFrame, params: dict) -> BlendedModel:
     consistente. El blend HGB+LightGBM sí: +0.03 a +0.10 pts de accuracy en
     8/8 combinaciones horizonte x ventana probadas en datos en vivo (dos
     ventanas independientes) -- señal real, aunque modesta, no ruido."""
-    return BlendedModel(_fit_hgb(train, params["hgb"]), _fit_lgb(train, params["lgb"]), params["w_hgb"])
+    return BlendedModel(_fit_hgb(train, params["hgb"], sample_weight), _fit_lgb(train, params["lgb"], sample_weight),
+                        params["w_hgb"])
 
 
 def predict(model, frame: pd.DataFrame) -> np.ndarray:
@@ -555,8 +557,30 @@ def train_production(out_dir: Path, params_by_h: dict[int, dict], horizons=HORIZ
     return train_production_from_frames(y, ctx, stations, out_dir, params_by_h, horizons=horizons)
 
 
+# Recetas de entrenamiento que compiten en sombra cuando se reentrena por drift
+# (pulso_pipeline.shadow): la base, una que pesa más lo reciente (vida media en días) y
+# una que solo usa la ventana reciente. Decide su desempeño en vivo, no una validación.
+RECIPES = {
+    "base": {},
+    "reciente": {"half_life_days": 7},
+    "ventana14": {"window_days": 14},
+}
+
+
+def recipe_rows(train: pd.DataFrame, h: int, train_end: int, recipe: str = "base"):
+    """(filas, pesos) de entrenamiento para una receta de `RECIPES`."""
+    cfg = RECIPES[recipe]
+    age = (train_end - (train["_t"] + h)).to_numpy()  # periodos entre el objetivo y el corte
+    if "window_days" in cfg:
+        keep = age < cfg["window_days"] * DAY
+        return train[keep], None
+    if "half_life_days" in cfg:
+        return train, 0.5 ** (age / (cfg["half_life_days"] * DAY))
+    return train, None
+
+
 def train_production_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, out_dir: Path,
-                                  params_by_h: dict[int, dict], horizons=HORIZONS) -> dict:
+                                  params_by_h: dict[int, dict], horizons=HORIZONS, recipe: str = "base") -> dict:
     """Igual que `train_production` pero a partir de frames ya cargados (p. ej. desde Supabase)."""
     import joblib
     train_end = production_train_end(len(y))
@@ -564,11 +588,13 @@ def train_production_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: p
     for h in horizons:
         frame = make_frame(y, ctx, stations, h)
         tr, _ = split_by_target(frame, h, train_end=train_end, val=None)
-        models[h] = fit(tr, params_by_h[h])
+        tr, weights = recipe_rows(tr, h, train_end, recipe)
+        models[h] = fit(tr, params_by_h[h], sample_weight=weights)
     import lightgbm
     import sklearn
     meta = {"sklearn_version": sklearn.__version__, "lightgbm_version": lightgbm.__version__,
             "data_cutoff": str(y.index[train_end]), "horizons": list(horizons), "features": FEATURES_NOTE,
+            "recipe": recipe,
             "trained_rows": {h: int(len(split_by_target(make_frame(y, ctx, stations, h), h, train_end, None)[0]))
                              for h in horizons}}
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -618,24 +644,20 @@ COMMON_SHRINK = 0.5
 COMMON_CLIP = (0.3, 4.0)
 
 
-def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_end_t: int | None = None) -> pd.Series:
-    """Corrección online de nivel por estación: sum(real)/sum(predicho) sobre los
-    últimos `BIAS_WINDOW` objetivos ya observados en el origen `last_t`
-    (objetivo t+h <= last_t, sin fuga), encogida hacia 1 con `BIAS_SHRINK`.
-
-    Motivo: la plataforma cambia patrones de demanda durante la competencia y el
-    modelo tarda en reaccionar hasta el siguiente reentrenamiento. Validado en
-    dos ventanas en vivo independientes (2026-09-09..14): +0.25 a +1.71 pts en
-    8/8 combinaciones horizonte x ventana (media +0.88). Solo se usan objetivos
-    posteriores a `train_end_t` para no medir residuos in-sample; si no hay
-    suficientes, el factor es 1 (sin corrección)."""
+def correction_ratios(model, frame: pd.DataFrame, h: int, last_t: int,
+                      train_end_t: int | None = None) -> tuple[pd.Series, float]:
+    """Razones crudas de la corrección online en el origen `last_t` (objetivos t+h <= last_t,
+    sin fuga): (sum(real)/sum(predicho) por estación en los últimos `BIAS_WINDOW` objetivos,
+    mediana entre estaciones de esa razón en los últimos `COMMON_WINDOW`). Cómo se convierten
+    en factor lo decide la política (`policy_factor`). Solo se usan objetivos posteriores a
+    `train_end_t` para no medir residuos in-sample."""
     tgt = frame["_t"] + h
     ok = (tgt <= last_t) & frame["_y"].notna() & frame["_scale"].notna()
     if train_end_t is not None:
         ok &= tgt > train_end_t
     past = frame[ok & (tgt > last_t - max(BIAS_WINDOW, COMMON_WINDOW))]
     if past.empty:
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float), np.nan
     df = pd.DataFrame({"station": past["station"].astype(int).to_numpy(), "t": (past["_t"] + h).to_numpy(),
                        "y": past["_y"].to_numpy(), "p": predict(model, past)})
 
@@ -644,11 +666,23 @@ def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_e
         sums = g[["y", "p"]].sum()[g.size() == window]
         return sums["y"] / sums["p"].where(sums["p"] > 0)
 
-    stations = pd.Index(sorted(df["station"].unique()))
-    own = (1 + BIAS_SHRINK * (_ratio(BIAS_WINDOW).clip(*BIAS_CLIP) - 1)).reindex(stations).fillna(1.0)
     pooled = _ratio(COMMON_WINDOW).dropna()
-    common = 1 + COMMON_SHRINK * (float(np.clip(pooled.median(), *COMMON_CLIP)) - 1) if len(pooled) else 1.0
-    return own * common
+    return _ratio(BIAS_WINDOW).dropna(), float(pooled.median()) if len(pooled) else np.nan
+
+
+def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_end_t: int | None = None) -> pd.Series:
+    """Factor de corrección por estación (propio x común, política por defecto, sin nowcast).
+
+    Motivo: la plataforma cambia patrones de demanda durante la competencia y el
+    modelo tarda en reaccionar hasta el siguiente reentrenamiento. Validado en
+    dos ventanas en vivo independientes (2026-09-09..14): +0.25 a +1.71 pts en
+    8/8 combinaciones horizonte x ventana (media +0.88)."""
+    own, common = correction_ratios(model, frame, h, last_t, train_end_t)
+    stations = np.arange(len(frame["station"].cat.categories))
+    r_own = pd.Series(stations).map(own).to_numpy(dtype=float)
+    f = policy_factor(r_own, np.full(len(stations), common), np.full(len(stations), np.nan),
+                      np.full(len(stations), h))
+    return pd.Series(f, index=stations)
 
 
 # Nowcast por estación: durante las oleadas del 18-sep cada ráfaga duraba ~45 min en una
@@ -660,6 +694,34 @@ NOWCAST_WINDOW = 2
 NOWCAST_STRENGTH = 0.5
 NOWCAST_DECAY = {1: 0.88, 2: 0.64, 3: 0.3, 4: 0.0}
 NOWCAST_CLIP = (0.33, 3.0)
+
+
+# Política de corrección: cuánto de cada razón se aplica. La de por defecto es la validada;
+# `pulso_pipeline.policy` puede elegir otra de `POLICIES` según el desempeño reciente.
+DEFAULT_POLICY = {"bias_shrink": BIAS_SHRINK, "common_shrink": COMMON_SHRINK, "nowcast_strength": NOWCAST_STRENGTH}
+# Lista fija y corta a propósito: un selector con muchas opciones persigue ruido. Simulación
+# del selector en el replay (6 ciclos, margen 0.5): +0.37 en las oleadas del 18-sep,
+# -0.04 / +0.01 en las ventanas 11..14 y 14..18-sep frente a dejar fija la estándar.
+DEFAULT_POLICY_NAME = "estandar"
+POLICIES = {
+    "estandar": DEFAULT_POLICY,
+    "reactiva": {"bias_shrink": 0.75, "common_shrink": 0.75, "nowcast_strength": 0.75},
+    "tranquila": {"bias_shrink": 0.25, "common_shrink": 0.25, "nowcast_strength": 0.25},
+    "nowcast": {"bias_shrink": 0.5, "common_shrink": 0.5, "nowcast_strength": 1.0},
+}
+
+
+def policy_factor(r_own, r_common, r_now, h, policy: dict | None = None) -> np.ndarray:
+    """Factor final (vectorizado) a partir de las razones crudas y el horizonte."""
+    p = policy or DEFAULT_POLICY
+    r_own, r_common, r_now = (np.asarray(v, dtype=float) for v in (r_own, r_common, r_now))
+    own = np.where(np.isnan(r_own), 1.0, 1 + p["bias_shrink"] * (np.clip(r_own, *BIAS_CLIP) - 1))
+    common = np.where(np.isnan(r_common), 1.0, 1 + p["common_shrink"] * (np.clip(r_common, *COMMON_CLIP) - 1))
+    f = own * common
+    decay = np.array([NOWCAST_DECAY.get(int(x), 0.0) for x in np.asarray(h).ravel()]).reshape(np.shape(h))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        adj = np.where(np.isnan(r_now), 1.0, (r_now / f) ** (p["nowcast_strength"] * decay))
+    return f * adj
 
 
 def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
@@ -683,7 +745,7 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 
 
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
-                          origin, targets, train_cutoff=None) -> pd.DataFrame:
+                          origin, targets, train_cutoff=None, policy: dict | None = None) -> pd.DataFrame:
     """Predice exactamente los pares (station_id, target_at) que pide un ciclo.
 
     `origin` es el `data_cutoff` del ciclo (debe ser el último índice de `y`).
@@ -719,21 +781,22 @@ def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stati
                                                freq=f"{STEP_MIN}min"))
         frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, h)
         cur = frame[frame["_t"] == len(y) - 1]
-        pred = predict(models[h], cur)
-        factors = recent_bias_factors(models[h], frame, h, len(y) - 1, train_end_t)
+        base = predict(models[h], cur)
+        own, common = correction_ratios(models[h], frame, h, len(y) - 1, train_end_t)
         st_idx = cur["station"].astype(int)
-        f = st_idx.map(factors).fillna(1.0).to_numpy()
-        n = st_idx.map(now).to_numpy(dtype=float)
-        expo = NOWCAST_STRENGTH * NOWCAST_DECAY.get(int(h), 0.0)
-        adj = np.where(np.isnan(n), 1.0, (n / f) ** expo)
-        pred = pred * f * adj
-        station_ids = stations.index[cur["station"].astype(int)]
-        preds_by_h[h] = pd.Series(pred, index=station_ids)
+        comp = pd.DataFrame({"base": base, "r_own": st_idx.map(own).to_numpy(dtype=float),
+                             "r_common": common, "r_now": st_idx.map(now).to_numpy(dtype=float)},
+                            index=stations.index[st_idx])
+        comp["value"] = comp["base"] * policy_factor(comp["r_own"], comp["r_common"], comp["r_now"],
+                                                     np.full(len(comp), h), policy)
+        preds_by_h[h] = comp
 
     rows = []
     for station_id, target_at, h in parsed:
         if station_id not in preds_by_h[h].index:
             raise ValueError(f"estación desconocida en el modelo: {station_id}")
+        c = preds_by_h[h].loc[station_id]
         rows.append({"station_id": station_id, "target_at": target_at, "horizon_steps": h,
-                     "value": round(float(preds_by_h[h][station_id]), 2)})
+                     "value": round(float(c["value"]), 2), "base": float(c["base"]),
+                     "r_own": float(c["r_own"]), "r_common": float(c["r_common"]), "r_now": float(c["r_now"])})
     return pd.DataFrame(rows)

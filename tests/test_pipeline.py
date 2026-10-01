@@ -219,3 +219,25 @@ def test_wait_for_cutoff_resyncs_until_data_arrives(monkeypatch) -> None:
     monkeypatch.setattr(spc.time, "sleep", lambda _: None)
     spc.wait_for_cutoff(object(), object(), "2026-09-18T10:00:00Z")
     assert len(syncs) == 2
+
+
+# ------------------------------------------------------- selector de política
+import numpy as _np  # noqa: E402
+
+import pulso_pipeline.policy as pol  # noqa: E402
+
+
+def test_policy_keeps_standard_without_enough_cycles_or_margin() -> None:
+    assert pol.choose({"estandar": 80.0, "reactiva": 90.0}, pol.WINDOW_CYCLES - 1)[0] == "estandar"
+    assert pol.choose({"estandar": 80.0, "reactiva": 80.4}, pol.WINDOW_CYCLES)[0] == "estandar"
+    assert pol.choose({"estandar": 80.0, "reactiva": 81.0}, pol.WINDOW_CYCLES)[0] == "reactiva"
+
+
+def test_policy_scores_reward_the_policy_that_follows_a_surge() -> None:
+    # la demanda real duplica la base y las razones lo muestran: la política más reactiva acierta más
+    comp = _pd.DataFrame({"station_id": ["a", "b"] * 4, "horizon_steps": [1] * 8, "base": [100.0] * 8,
+                          "r_own": [2.0] * 8, "r_common": [2.0] * 8, "r_now": [2.0] * 8, "y": [200.0] * 8})
+    s = pol.policy_scores(comp)
+    assert s["reactiva"] > s["estandar"] > s["tranquila"]
+    comp_nan = comp.assign(r_own=_np.nan, r_common=_np.nan, r_now=_np.nan)
+    assert len(set(pol.policy_scores(comp_nan).values())) == 1  # sin razones, todas dan lo mismo
