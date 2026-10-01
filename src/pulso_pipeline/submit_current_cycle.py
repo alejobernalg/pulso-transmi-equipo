@@ -24,7 +24,7 @@ import joblib
 from pulso_forecast import forecast_for_targets, wide_from_frames
 from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient, PulsoTransmiError
 
-from . import db
+from . import db, shadow
 
 STEP_MIN = 15
 RETRYABLE_MAX_ATTEMPTS = 3
@@ -202,6 +202,11 @@ def main(argv: list[str] | None = None) -> int:
                               decision_reason="no_open_cycle")
                 return 0
 
+            try:  # promoción / reversión del modelo en sombra: nunca bloquea la entrega
+                shadow.evaluate_shadow(database)
+            except Exception as exc:  # noqa: BLE001
+                print(f"aviso: no se pudo evaluar el modelo en sombra ({exc})")
+
             model_row = db.get_active_model(database)
             if model_row is None:
                 raise db.PipelineDBError(
@@ -328,6 +333,10 @@ def main(argv: list[str] | None = None) -> int:
             db.finish_run(database, run_id, status="success", decision="keep",
                           decision_reason="submitted", data_cutoff=cutoff)
             print(f"entregado: {cycle['cycle_id']} -> {receipt.get('submission_id')}")
+            try:  # el modelo en sombra predice el mismo ciclo, sin enviar
+                shadow.predict_shadow(database, cycle, y, ctx, stations, targets, model_row["model_id"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"aviso: no se pudo predecir con el modelo en sombra ({exc})")
             return 0
     except Exception as exc:  # noqa: BLE001 - se registra y se re-lanza como fallo del job
         db.finish_run(database, run_id, status="failed", failed_stage="predict", error_message=str(exc))

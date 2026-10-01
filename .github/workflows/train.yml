@@ -11,6 +11,11 @@ on:
         description: "Puntos de accuracy que el candidato puede perder frente al champion sin bloquear la promoción"
         type: string
         default: "0.5"
+      mode:
+        description: "promote: decide la validación offline; shadow: decide el desempeño en vivo (4 ciclos)"
+        type: choice
+        options: [promote, shadow]
+        default: promote
   # Activar cuando haya al menos una promoción manual validada:
   # schedule:
   #   - cron: "17 6 * * *"
@@ -47,4 +52,4 @@ jobs:
           MLFLOW_TRACKING_PASSWORD: ${{ secrets.DAGSHUB_TOKEN }}
           MLFLOW_DISABLE_AGENT_HINT: "1"
         run: |
-          python -m pulso_pipeline.train_and_promote ${{ inputs.dry_run && '--dry-run' || '' }} --tolerance ${{ inputs.tolerance }}
+          python -m pulso_pipeline.train_and_promote ${{ inputs.dry_run && '--dry-run' || '' }} --tolerance ${{ inputs.tolerance || '0.5' }} --mode ${{ inputs.mode || 'promote' }}

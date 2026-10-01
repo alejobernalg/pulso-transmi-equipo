@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 8
     permissions:
       contents: read
+      actions: write  # el disparador lanza train.yml en modo sombra
     steps:
       - uses: actions/checkout@v4
 
@@ -36,3 +37,13 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python -m pulso_pipeline.submit_current_cycle
+
+      - name: Leaderboard y reentrenamiento automático
+        if: always()
+        continue-on-error: true
+        env:
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m pulso_pipeline.shadow

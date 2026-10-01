@@ -271,6 +271,23 @@ probar el camino completo sin gastar intentos reales de la competencia.
    `DAGSHUB_TOKEN` del repo; los modelos anteriores se cargaron con
    `python -m pulso_pipeline.backfill_mlflow` (idempotente).
 
+**Reentrenamiento automático con evaluación en sombra** (`pulso_pipeline.shadow`, 2026-10-01):
+
+1. Después de cada corrida de `predict.yml` se guarda una foto del leaderboard
+   (`leaderboard_snapshots`). Si el puesto en `rolling_24h` está 3 o más por debajo del
+   acumulado, se dispara `train.yml` con `--mode shadow` (salvo que ya haya una sombra
+   pendiente o se haya disparado hace menos de 2 h).
+2. El candidato queda en etapa `shadow` (`model_versions.stage`): predice cada ciclo junto
+   al champion pero no se envía (`shadow_predictions`).
+3. Con 4 ciclos ya observados, ambos se comparan en los mismos objetivos con la métrica del
+   reto. Si la sombra gana se promueve y el champion anterior pasa a sombra; si en sus 4
+   ciclos vuelve a ganar, se revierte. Ninguna de estas etapas bloquea la entrega.
+
+Por qué en sombra y no con la validación offline: con drift, la ventana de validación más
+reciente siempre es más difícil, y un champion recién entrenado no tiene un día de datos
+posteriores para compararlo fuera de muestra. El desempeño en vivo, en los mismos ciclos,
+es la única comparación justa.
+
 El cron de `predict.yml` está activo en el archivo tal como lo recomienda la guía,
 pero **no corre en ningún lado hasta hacer push** a un repositorio de GitHub con los
 secrets configurados (`PULSO_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`). El

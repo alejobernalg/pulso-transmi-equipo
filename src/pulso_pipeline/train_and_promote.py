@@ -30,7 +30,7 @@ from pulso_forecast import (
 )
 from pulso_transmi import PulsoTransmiClient
 
-from . import db, tracking
+from . import db, shadow, tracking
 from .submit_current_cycle import git_commit
 
 MIN_BOOTSTRAP_ROWS = 40_000
@@ -185,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="evalúa y decide, no escribe en Supabase")
     parser.add_argument("--tolerance", type=float, default=0.5,
                         help="puntos de accuracy que el candidato puede perder frente al champion sin bloquear la promoción")
+    parser.add_argument("--mode", choices=("promote", "shadow"), default="promote",
+                        help="promote: decide con la validación offline; shadow: el candidato entra en "
+                             "sombra y lo decide su desempeño en vivo (pulso_pipeline.shadow)")
     args = parser.parse_args(argv)
 
     database = db.get_client()
@@ -192,6 +195,11 @@ def main(argv: list[str] | None = None) -> int:
     run_id = db.start_run(database, commit)
 
     try:
+        if args.mode == "shadow" and (pending := db.get_shadow_model(database)) is not None:
+            reason = f"ya hay un modelo en sombra ({pending['version']})"
+            print(reason)
+            db.finish_run(database, run_id, status="success", decision="keep", decision_reason=reason)
+            return 0
         with PulsoTransmiClient() as client:
             ensure_bootstrapped(client, database)
             obs_df, ctx_df, stations_df = db.fetch_history(database)
@@ -225,6 +233,9 @@ def main(argv: list[str] | None = None) -> int:
                 promote = False
                 reason = f"candidato {candidate_accuracy:.2f} < champion {champion_accuracy:.2f} - tolerancia {args.tolerance}"
 
+            if args.mode == "shadow":
+                # la validación offline queda como referencia; decide el desempeño en vivo
+                promote, reason = True, f"sombra ({shadow.SHADOW_CYCLES} ciclos en vivo) | offline: {reason}"
             print(f"candidato: accuracy media {candidate_accuracy:.2f} | decisión: "
                   f"{'promover' if promote else 'conservar champion'} ({reason})")
 
@@ -274,13 +285,17 @@ def main(argv: list[str] | None = None) -> int:
                             "metric_name": "accuracy", "window_label": f"h{h}", "value": acc, "computed_at": now,
                         })
                 db.save_metrics(database, metric_rows)
-                db.promote_model(database, model_id)
-                print(f"promovido: {version} ({model_id})")
+                if args.mode == "shadow":
+                    db.set_stage(database, model_id, "shadow")
+                    print(f"en sombra: {version} ({model_id})")
+                else:
+                    db.promote_model(database, model_id)
+                    print(f"promovido: {version} ({model_id})")
                 tracking.log_training(
                     report=report, params_by_h=params_by_h, version=version, decision="retrain", reason=reason,
                     git_commit=commit, data_cutoff=str(y.index[-1]),
                     train_cutoff=str(y.index[production_train_end(len(y))]), supabase_model_id=model_id,
-                    joblib_bytes=joblib_bytes, promote=True)
+                    joblib_bytes=joblib_bytes, promote=args.mode == "promote")
             else:
                 tracking.log_training(
                     report=report, params_by_h={h: report["horizons"][f"h{h}"]["best_params"] for h in HORIZONS},

@@ -136,9 +136,40 @@ def insert_model_version(db: Client, **fields: Any) -> str:
     return row["model_id"]
 
 
-def promote_model(db: Client, model_id: str) -> None:
-    db.table("model_versions").update({"is_active": False}).eq("is_active", True).execute()
-    db.table("model_versions").update({"is_active": True}).eq("model_id", model_id).execute()
+def promote_model(db: Client, model_id: str, previous_stage: str = "retired") -> None:
+    """Activa `model_id` como champion; el champion anterior pasa a `previous_stage`."""
+    now = datetime.now(timezone.utc).isoformat()
+    db.table("model_versions").update({"is_active": False, "stage": previous_stage, "stage_changed_at": now}) \
+        .eq("is_active", True).execute()
+    db.table("model_versions").update({"is_active": True, "stage": "champion", "stage_changed_at": now}) \
+        .eq("model_id", model_id).execute()
+
+
+def set_stage(db: Client, model_id: str, stage: str) -> None:
+    db.table("model_versions").update(
+        {"stage": stage, "stage_changed_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("model_id", model_id).execute()
+
+
+def get_shadow_model(db: Client) -> dict[str, Any] | None:
+    rows = db.table("model_versions").select("*").eq("stage", "shadow").order("stage_changed_at", desc=True) \
+        .limit(1).execute().data
+    return rows[0] if rows else None
+
+
+def save_shadow_predictions(db: Client, rows: list[dict]) -> None:
+    if rows:
+        db.table("shadow_predictions").upsert(rows, on_conflict="cycle_id,model_id,station_id,target_at").execute()
+
+
+def save_leaderboard_snapshot(db: Client, row: dict[str, Any]) -> None:
+    db.table("leaderboard_snapshots").insert(row).execute()
+
+
+def last_retrain_trigger_at(db: Client) -> str | None:
+    rows = db.table("leaderboard_snapshots").select("taken_at").eq("triggered", True) \
+        .order("taken_at", desc=True).limit(1).execute().data
+    return rows[0]["taken_at"] if rows else None
 
 
 # --------------------------------------------------------------------- runs

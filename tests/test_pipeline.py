@@ -165,3 +165,39 @@ def test_tracking_flattens_params_and_metrics() -> None:
                            "h2": {"model": 86.0}}}
     m = tracking._metrics(report)
     assert m["accuracy"] == 87.0 and m["h1.station_02300"] == 86.5 and m["h1.same_block.champion"] == 87.7
+
+
+# --------------------------------------------- reentrenamiento automático en sombra
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+import pandas as _pd  # noqa: E402
+
+import pulso_pipeline.shadow as sh  # noqa: E402
+
+_NOW = _dt(2026, 10, 1, tzinfo=_tz.utc)
+
+
+def test_trigger_when_recent_rank_is_three_below_cumulative() -> None:
+    assert sh.should_trigger(2, 5, False, None, _NOW)[0] is True
+    assert sh.should_trigger(2, 4, False, None, _NOW)[0] is False
+
+
+def test_trigger_blocked_by_pending_shadow_or_cooldown() -> None:
+    assert sh.should_trigger(2, 6, True, None, _NOW)[0] is False
+    assert sh.should_trigger(2, 6, False, _NOW - _td(minutes=30), _NOW)[0] is False
+    assert sh.should_trigger(2, 6, False, _NOW - _td(hours=3), _NOW)[0] is True
+    assert sh.should_trigger(None, 6, False, None, _NOW)[0] is False
+
+
+def test_challenge_uses_the_competition_metric_per_station() -> None:
+    f = _pd.DataFrame({"station_id": ["a", "a", "b", "b"], "y": [100, 100, 10, 10],
+                       "champion": [90, 110, 5, 15], "shadow": [100, 100, 9, 11]})
+    champ, shadow = sh.challenge_accuracy(f)
+    assert champ == 70.0 and shadow == 95.0  # a: 90 vs 100, b: 50 vs 90, promedio por estación
+
+
+def test_decide_promotes_keeps_and_rolls_back() -> None:
+    assert sh.decide(80.0, 82.0, shadow_is_previous_champion=False) == ("promote", "shadow")
+    assert sh.decide(82.0, 80.0, shadow_is_previous_champion=False) == ("discard", "rejected")
+    assert sh.decide(80.0, 82.0, shadow_is_previous_champion=True) == ("promote", "rejected")
+    assert sh.decide(82.0, 80.0, shadow_is_previous_champion=True) == ("discard", "retired")

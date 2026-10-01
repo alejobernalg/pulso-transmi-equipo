@@ -92,6 +92,10 @@ class PulsoTransmiClient:
     def submission_receipt(self, submission_id: str) -> dict[str, Any]:
         return self._get(f"/v1/submissions/{submission_id}").json()
 
+    def leaderboard(self, window: str = "cumulative") -> list[dict[str, Any]]:
+        """Posiciones del reto; `window` es `cumulative` o `rolling_24h`."""
+        return self._get("/v1/leaderboard", params={"window": window}).json()["data"]
+
     def submit(
         self,
         *,
