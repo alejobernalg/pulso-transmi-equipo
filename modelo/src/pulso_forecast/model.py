@@ -744,16 +744,24 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
     return (g["y"] / g["p"].where(g["p"] > 0)).clip(*NOWCAST_CLIP).dropna()
 
 
-# Régimen cíclico: desde el 18-sep ~05 h UTC la demanda dejó el perfil diario y pasó a una
-# oscilación limpia de 4 h (16 periodos) con fase propia por estación; el modelo (perfiles
-# diarios) cayó a ~40 % por ciclo. Antes de cada ciclo se mide, en los últimos
-# `CYCLE_GATE_WINDOW` objetivos ya observados, el modelo a +15 min contra y[t-16]; si la
-# estacional gana por más de `CYCLE_GATE_MARGIN` puntos se usa y[t+h-16] en ese ciclo.
-# Simulado sobre los 182 ciclos enviados (10-sep..18-sep): 0 activaciones en los 172 ciclos
-# normales y ~90 vs ~40 en los del régimen nuevo (83.71 vs 81.13 en total).
+# Selector de expertos. El drift de la continuación (revisiones 2 y 3 del docente) cambia la
+# *forma* temporal de la demanda: el 18-sep ~05 h UTC pasó del perfil diario a una oscilación
+# de 4 h por estación y el champion (perfiles diarios, entrenado con semanas del régimen viejo)
+# cayó a ~40 % por ciclo. Reentrenar el champion no alcanza: sus datos siguen siendo casi todos
+# del régimen viejo. En cada ciclo compiten tres expertos y se usa el que mejor predijo los dos
+# ciclos anteriores ya observados (recalculados desde esos cortes, sin fuga):
+#   - "champion": el modelo entrenado, con su corrección online (lo de siempre);
+#   - "ciclica16": y[t+h-16], la demanda del mismo punto 4 h antes;
+#   - "adaptativo": Extra Trees reentrenado en cada ciclo con las últimas `ONLINE_WINDOW`
+#     horas-cuarto y solo rezagos recientes, así aprende cualquier forma nueva en horas.
+# El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
 CYCLE_PERIOD = 16
-CYCLE_GATE_WINDOW = 8
-CYCLE_GATE_MARGIN = 5.0
+ONLINE_WINDOW = 48                 # 12 h de orígenes de entrenamiento
+ONLINE_LAGS = (*range(24), 28, 32, 40, 48)
+ONLINE_SEASONAL = (16, 32, 48, 96)
+ONLINE_SCALE = DAY                 # nivel de la estación: media de las últimas 24 h
+EXPERT_SCORE_CYCLES = 2            # ciclos anteriores (4 objetivos cada uno) para puntuar
+EXPERT_MARGIN = 3.0
 
 
 def _wape_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -763,31 +771,101 @@ def _wape_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.clip(100 * (1 - err[ok] / tot[ok]), 0, None).mean()) if ok.any() else np.nan
 
 
-def cyclic_regime_active(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
-                         y_raw: pd.DataFrame | None = None) -> tuple[bool, str]:
-    """¿La estacional de `CYCLE_PERIOD` le gana claramente al modelo en los últimos objetivos?
-    Solo usa datos <= origen (los objetivos de la ventana ya se observaron). `y_raw` es la
-    demanda sin alinear (los detectores de quiebre pueden reescalar las últimas horas)."""
-    if 1 not in models or len(y) < CYCLE_PERIOD + CYCLE_GATE_WINDOW + 1:
-        return False, "sin datos para evaluar el régimen cíclico"
+def _online_features(Y: np.ndarray, origins, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """Features del experto adaptativo en cada origen t (solo Y[<= t]), apiladas por estación."""
+    n_s = Y.shape[1]
+    X, S = [], []
+    for t in origins:
+        sc = np.nanmean(Y[t - ONLINE_SCALE + 1:t + 1], axis=0) + 1.0
+        cols = [Y[t - j] / sc for j in ONLINE_LAGS]
+        cols += [Y[t + h - k] / sc for k in ONLINE_SEASONAL]  # k >= 16 > h: ya observado
+        cols += [np.nanmean(Y[t - 3:t + 1], axis=0) / sc, np.nanmean(Y[t - 15:t + 1], axis=0) / sc,
+                 np.full(n_s, h), np.arange(n_s)]
+        X.append(np.stack(cols, axis=1))
+        S.append(sc)
+    return np.nan_to_num(np.concatenate(X)), np.concatenate(S)
+
+
+def adaptive_forecast(Y: np.ndarray, origin_t: int, horizons) -> dict[int, np.ndarray]:
+    """{h: predicción por estación} del experto adaptativo, entrenado solo con objetivos <= origen."""
+    from sklearn.ensemble import ExtraTreesRegressor
+    out = {}
+    for h in horizons:
+        train_origins = np.arange(origin_t - ONLINE_WINDOW, origin_t - h + 1)
+        X, sc = _online_features(Y, train_origins, h)
+        target = np.concatenate([Y[t + h] for t in train_origins]) / sc
+        ok = np.isfinite(target)
+        mdl = ExtraTreesRegressor(n_estimators=150, min_samples_leaf=3, n_jobs=-1, random_state=0)
+        mdl.fit(X[ok], target[ok])
+        Xc, scc = _online_features(Y, [origin_t], h)
+        out[h] = np.clip(mdl.predict(Xc), 0, None) * scc
+    return out
+
+
+def _champion_components(models, y, ctx, stations, horizons, train_end_t, policy) -> dict[int, pd.DataFrame]:
+    """Predicción del champion (con corrección online) desde el último índice de `y`."""
+    origin = y.index[-1]
+    now = nowcast_ratios(models, y, ctx, stations, train_end_t) if 1 in models else pd.Series(dtype=float)
+    out = {}
+    for h in horizons:
+        ext_idx = y.index.append(pd.date_range(origin + pd.Timedelta(minutes=STEP_MIN), periods=h,
+                                               freq=f"{STEP_MIN}min"))
+        frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, h)
+        cur = frame[frame["_t"] == len(y) - 1]
+        base = predict(models[h], cur)
+        own, common = correction_ratios(models[h], frame, h, len(y) - 1, train_end_t)
+        st_idx = cur["station"].astype(int)
+        comp = pd.DataFrame({"base": base, "r_own": st_idx.map(own).to_numpy(dtype=float),
+                             "r_common": common, "r_now": st_idx.map(now).to_numpy(dtype=float)},
+                            index=stations.index[st_idx])
+        comp["value"] = comp["base"] * policy_factor(comp["r_own"], comp["r_common"], comp["r_now"],
+                                                     np.full(len(comp), h), policy)
+        out[h] = comp.reindex(stations.index)
+    return out
+
+
+def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t: int, horizons,
+                   train_end_t, policy):
+    """{h: valores por estación} de un experto desde el origen `origin_t` (índice en `y`)."""
+    if name == "champion":
+        comps = _champion_components(models, y.iloc[:origin_t + 1], ctx.iloc[:origin_t + 1], stations,
+                                     horizons, train_end_t, policy)
+        return {h: c["value"].to_numpy(dtype=float) for h, c in comps.items()}
+    if name == "ciclica16":
+        return {h: Y[origin_t + h - CYCLE_PERIOD] for h in horizons}
+    return adaptive_forecast(Y, origin_t, horizons)
+
+
+EXPERTS = ("champion", "ciclica16", "adaptativo")
+
+
+def select_expert(models, y, ctx, stations, Y: np.ndarray, train_end_t, policy) -> tuple[str, str, dict]:
+    """Experto para el ciclo actual según la accuracy en los `EXPERT_SCORE_CYCLES` ciclos previos."""
     last_t = len(y) - 1
-    ext_idx = y.index.append(pd.date_range(y.index[-1] + pd.Timedelta(minutes=STEP_MIN), periods=1,
-                                           freq=f"{STEP_MIN}min"))
-    frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, 1)
-    tgt = frame["_t"] + 1
-    past = frame[(tgt <= last_t) & (tgt > last_t - CYCLE_GATE_WINDOW) & frame["_scale"].notna()]
-    if past["_t"].nunique() < CYCLE_GATE_WINDOW:
-        return False, "ventana incompleta para el régimen cíclico"
-    n_s = y.shape[1]
-    order = np.argsort(past["_t"].to_numpy() * n_s + past["station"].astype(int).to_numpy(), kind="stable")
-    model_pred = predict(models[1], past)[order].reshape(CYCLE_GATE_WINDOW, n_s)
-    win = np.arange(last_t - CYCLE_GATE_WINDOW + 1, last_t + 1)
-    y_np = (y if y_raw is None else y_raw).reindex(index=y.index, columns=y.columns).to_numpy(dtype=float)
-    acc_model = _wape_accuracy(y_np[win], model_pred)
-    acc_cycle = _wape_accuracy(y_np[win], y_np[win - CYCLE_PERIOD])
-    active = bool(np.isfinite(acc_cycle) and np.isfinite(acc_model) and acc_cycle > acc_model + CYCLE_GATE_MARGIN)
-    return active, f"régimen cíclico {'ACTIVO' if active else 'inactivo'} (estacional {CYCLE_PERIOD}: " \
-                   f"{acc_cycle:.1f} vs modelo {acc_model:.1f} en los últimos {CYCLE_GATE_WINDOW} objetivos)"
+    hs = sorted(models)
+    min_hist = ONLINE_SCALE + max(ONLINE_SEASONAL) + ONLINE_WINDOW + 4 * EXPERT_SCORE_CYCLES
+    if last_t < min_hist or not all(h in models for h in (1, 2, 3, 4)):
+        return "champion", "historia insuficiente para puntuar expertos: champion", {}
+    scores: dict[str, list[float]] = {e: [] for e in EXPERTS}
+    for k in range(1, EXPERT_SCORE_CYCLES + 1):
+        o = last_t - 4 * k
+        truth = np.stack([Y[o + h] for h in hs])
+        for e in EXPERTS:
+            try:
+                vals = _expert_values(e, models, y, ctx, stations, Y, o, hs, train_end_t, policy)
+                scores[e].append(_wape_accuracy(truth, np.stack([vals[h] for h in hs])))
+            except Exception:  # noqa: BLE001 - un experto que falla no compite
+                scores[e].append(np.nan)
+    mean = {e: float(np.mean(v)) if np.isfinite(v).all() else np.nan for e, v in scores.items()}
+    valid = {e: v for e, v in mean.items() if np.isfinite(v)}
+    summary = ", ".join(f"{e} {v:.1f}" for e, v in sorted(valid.items(), key=lambda kv: -kv[1]))
+    if not np.isfinite(mean["champion"]):
+        best = max(valid, key=valid.get) if valid else "champion"
+        return best, f"experto {best} (champion sin puntaje; {summary})", mean
+    best = max(valid, key=valid.get)
+    if best != "champion" and valid[best] > mean["champion"] + EXPERT_MARGIN:
+        return best, f"experto {best} supera al champion por {valid[best] - mean['champion']:.1f} ({summary})", mean
+    return "champion", f"experto champion ({summary})", mean
 
 
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
@@ -822,31 +900,23 @@ def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stati
     train_end_t = None
     if train_cutoff is not None:
         train_end_t = int(y.index.searchsorted(pd.Timestamp(train_cutoff), side="right")) - 1
-    now = nowcast_ratios(models, y, ctx, stations, train_end_t) if 1 in models else pd.Series(dtype=float)
-    cyclic, cyclic_reason = cyclic_regime_active(models, y, ctx, stations, y_raw)
-    print(cyclic_reason)
-    y_season = (y if y_raw is None else y_raw).reindex(index=y.index, columns=stations.index)
-    for h in by_h:
-        seasonal = y_season.iloc[len(y) - 1 + h - CYCLE_PERIOD].to_numpy(dtype=float)
-        if cyclic and np.isfinite(seasonal).all():  # sin corrección: razones NaN -> factor 1 en toda política
+    hs = [int(h) for h in by_h]
+    Y = (y if y_raw is None else y_raw).reindex(index=y.index, columns=stations.index).to_numpy(dtype=float)
+    try:
+        expert, reason, _ = select_expert(models, y, ctx, stations, Y, train_end_t, policy)
+    except Exception as exc:  # noqa: BLE001 - ante cualquier duda, el champion
+        expert, reason = "champion", f"champion (no se pudo puntuar expertos: {exc})"
+    print(reason)
+    preds_by_h = _champion_components(models, y, ctx, stations, hs, train_end_t, policy)
+    if expert != "champion":
+        vals = _expert_values(expert, models, y, ctx, stations, Y, len(y) - 1, hs, train_end_t, policy)
+        if all(np.isfinite(vals[h]).all() for h in hs):  # sin corrección: razones NaN -> factor 1
             nan = np.full(len(stations), np.nan)
-            comp = pd.DataFrame({"base": seasonal, "r_own": nan, "r_common": nan, "r_now": nan}, index=stations.index)
-            comp["value"] = comp["base"].clip(lower=0)
-            preds_by_h[h] = comp
-            continue
-        ext_idx = y.index.append(pd.date_range(origin + pd.Timedelta(minutes=STEP_MIN), periods=h,
-                                               freq=f"{STEP_MIN}min"))
-        frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, h)
-        cur = frame[frame["_t"] == len(y) - 1]
-        base = predict(models[h], cur)
-        own, common = correction_ratios(models[h], frame, h, len(y) - 1, train_end_t)
-        st_idx = cur["station"].astype(int)
-        comp = pd.DataFrame({"base": base, "r_own": st_idx.map(own).to_numpy(dtype=float),
-                             "r_common": common, "r_now": st_idx.map(now).to_numpy(dtype=float)},
-                            index=stations.index[st_idx])
-        comp["value"] = comp["base"] * policy_factor(comp["r_own"], comp["r_common"], comp["r_now"],
-                                                     np.full(len(comp), h), policy)
-        preds_by_h[h] = comp
+            for h in hs:
+                comp = pd.DataFrame({"base": np.clip(vals[h], 0, None), "r_own": nan, "r_common": nan,
+                                     "r_now": nan}, index=stations.index)
+                comp["value"] = comp["base"]
+                preds_by_h[h] = comp
 
     rows = []
     for station_id, target_at, h in parsed:
