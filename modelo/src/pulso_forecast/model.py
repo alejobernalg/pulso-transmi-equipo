@@ -751,11 +751,15 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 # del régimen viejo. En cada ciclo compiten tres expertos y se usa el que mejor predijo los dos
 # ciclos anteriores ya observados (recalculados desde esos cortes, sin fuga):
 #   - "champion": el modelo entrenado, con su corrección online (lo de siempre);
-#   - "ciclica16": y[t+h-16], la demanda del mismo punto 4 h antes;
+#   - "ciclica16" / "ciclica16xK": y[t+h-16], la demanda del mismo punto 4 h antes, o el
+#     promedio de las últimas K oscilaciones (K <= `CYCLE_MAX_PERIODS`). Copiar una sola
+#     oscilación arrastra su ruido; al madurar el régimen promediar más gana (18-sep 18 h:
+#     93.1 con K=3 vs 91.1 con K=1) y el selector va subiendo K solo;
 #   - "adaptativo": Extra Trees reentrenado en cada ciclo con las últimas `ONLINE_WINDOW`
 #     horas-cuarto y solo rezagos recientes, así aprende cualquier forma nueva en horas.
 # El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
 CYCLE_PERIOD = 16
+CYCLE_MAX_PERIODS = 6
 ONLINE_WINDOW = 48                 # 12 h de orígenes de entrenamiento
 ONLINE_LAGS = (*range(24), 28, 32, 40, 48)
 ONLINE_SEASONAL = (16, 32, 48, 96)
@@ -831,19 +835,21 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
         comps = _champion_components(models, y.iloc[:origin_t + 1], ctx.iloc[:origin_t + 1], stations,
                                      horizons, train_end_t, policy)
         return {h: c["value"].to_numpy(dtype=float) for h, c in comps.items()}
-    if name == "ciclica16":
-        return {h: Y[origin_t + h - CYCLE_PERIOD] for h in horizons}
+    if name.startswith("ciclica16"):
+        k = int(name.split("x")[1]) if "x" in name else 1
+        return {h: np.mean([Y[origin_t + h - CYCLE_PERIOD * j] for j in range(1, k + 1)], axis=0) for h in horizons}
     return adaptive_forecast(Y, origin_t, horizons)
 
 
-EXPERTS = ("champion", "ciclica16", "adaptativo")
+EXPERTS = ("champion", "adaptativo", "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
 
 
 def select_expert(models, y, ctx, stations, Y: np.ndarray, train_end_t, policy) -> tuple[str, str, dict]:
     """Experto para el ciclo actual según la accuracy en los `EXPERT_SCORE_CYCLES` ciclos previos."""
     last_t = len(y) - 1
     hs = sorted(models)
-    min_hist = ONLINE_SCALE + max(ONLINE_SEASONAL) + ONLINE_WINDOW + 4 * EXPERT_SCORE_CYCLES
+    min_hist = max(ONLINE_SCALE + max(ONLINE_SEASONAL) + ONLINE_WINDOW, CYCLE_PERIOD * CYCLE_MAX_PERIODS) \
+        + 4 * EXPERT_SCORE_CYCLES
     if last_t < min_hist or not all(h in models for h in (1, 2, 3, 4)):
         return "champion", "historia insuficiente para puntuar expertos: champion", {}
     scores: dict[str, list[float]] = {e: [] for e in EXPERTS}
