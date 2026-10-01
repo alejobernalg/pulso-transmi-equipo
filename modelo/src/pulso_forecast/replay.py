@@ -7,11 +7,11 @@ origen, se alinea (`align_history`), se arman las features y se predice cada
 horizonte. En vez de aplicar ahí la corrección de nivel, se guardan la
 predicción base y los residuos de los últimos objetivos ya observados, así
 cualquier regla de corrección (`BiasRule`) se evalúa después sin volver a
-predecir. `apply_rule(..., production_rule)` reproduce `forecast_for_targets`.
+predecir. `apply_production(preds, resid)` reproduce `forecast_for_targets`.
 
 Uso típico (ver `python -m pulso_forecast.replay --help`):
     preds, resid = collect(models, y_raw, ctx, stations, origins, train_cutoff)
-    scored = apply_rule(preds, resid, production_rule)
+    scored = apply_production(preds, resid)
     summary(scored)
 """
 from __future__ import annotations
@@ -78,7 +78,8 @@ def collect(models: dict, y_raw: pd.DataFrame, ctx: pd.DataFrame, stations: pd.D
 
 # --------------------------------------------------------------- reglas de nivel
 def production_rule(g: pd.DataFrame) -> float:
-    """Réplica de `recent_bias_factors` para un (origen, estación, horizonte)."""
+    """Parte por estación de `recent_bias_factors` para un (origen, estación, horizonte).
+    El factor común entre estaciones lo agrega `apply_production`."""
     w = g[g["age"] <= M.BIAS_WINDOW]
     if len(w) != M.BIAS_WINDOW or w["p"].sum() <= 0:
         return 1.0
@@ -91,6 +92,24 @@ def apply_rule(preds: pd.DataFrame, resid: pd.DataFrame, rule: Callable[[pd.Data
                .apply(rule).rename("factor"))
     out = preds.join(factors, on=["origin", "station_id", "h"])
     out["factor"] = out["factor"].fillna(1.0)
+    out["pred"] = out["base"] * out["factor"]
+    return out
+
+
+def common_factors(resid: pd.DataFrame) -> pd.Series:
+    """Factor común de `recent_bias_factors` por (origen, horizonte): mediana entre estaciones
+    de sum(y)/sum(p) en los últimos `COMMON_WINDOW` objetivos, aplicada a medias."""
+    w = resid[resid["age"] <= M.COMMON_WINDOW]
+    g = w.groupby(["origin", "h", "station_id"])
+    sums = g[["y", "p"]].sum()[(g.size() == M.COMMON_WINDOW) & (g["p"].sum() > 0)]
+    med = (sums["y"] / sums["p"]).groupby(level=["origin", "h"]).median()
+    return (1 + M.COMMON_SHRINK * (med.clip(*M.COMMON_CLIP) - 1)).rename("common")
+
+
+def apply_production(preds: pd.DataFrame, resid: pd.DataFrame) -> pd.DataFrame:
+    """Réplica completa de `forecast_for_targets`: corrección por estación x factor común."""
+    out = apply_rule(preds, resid, production_rule).join(common_factors(resid), on=["origin", "h"])
+    out["factor"] = out["factor"] * out["common"].fillna(1.0)
     out["pred"] = out["base"] * out["factor"]
     return out
 
@@ -135,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     preds, resid = collect(bundle["models"], y_raw, ctx, stations, origins, bundle["meta"]["data_cutoff"])
     preds.to_pickle(f"{args.out}.preds.pkl")
     resid.to_pickle(f"{args.out}.resid.pkl")
-    scored = apply_rule(preds, resid, production_rule)
+    scored = apply_production(preds, resid)
     print(station_accuracy(scored).round(2).to_string())
     print(f"promedio: {summary(scored):.2f} (base sin corrección: {summary(scored, 'base'):.2f})")
     return 0

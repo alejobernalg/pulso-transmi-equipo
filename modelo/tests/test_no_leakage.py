@@ -63,7 +63,8 @@ def test_bias_correction_only_uses_observed_targets(h):
     assert len(base) == len(stations)
     pd.testing.assert_series_equal(base, dirty)
     lo, hi = (1 + pm.BIAS_SHRINK * (c - 1) for c in pm.BIAS_CLIP)
-    assert base.between(lo, hi).all()
+    clo, chi = (1 + pm.COMMON_SHRINK * (c - 1) for c in pm.COMMON_CLIP)
+    assert base.between(lo * clo, hi * chi).all()
 
 
 def test_peak_shift_detected_and_aligned(monkeypatch):

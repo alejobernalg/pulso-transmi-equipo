@@ -607,6 +607,15 @@ BIAS_CLIP = (0.7, 1.3)
 # en la historia, y ese modo solo amplificaba oleadas pasajeras: el 18-sep de madrugada
 # multiplicaba la predicción justo cuando la oleada ya había bajado. Replay sin él: 35.6 ->
 # 41.9 en esa madrugada, -0.04/-0.05 en las ventanas de escalones del 11..18-sep.
+#
+# Factor común del sistema: mediana entre estaciones de sum(real)/sum(predicho) en la última
+# hora, aplicado a medias. Las oleadas del 18-sep saltaban de estación en estación (x0.6 a
+# x11 por estación y hora), pero la mediana entre estaciones se mantenía en x2-x3: el nivel
+# general sí es predecible aunque el lugar de cada ráfaga no. Replay: 42.3 -> 46.4 durante
+# las oleadas, +0.006 / -0.019 en las ventanas 11..14 y 14..18-sep.
+COMMON_WINDOW = 4
+COMMON_SHRINK = 0.5
+COMMON_CLIP = (0.3, 4.0)
 
 
 def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_end_t: int | None = None) -> pd.Series:
@@ -624,14 +633,22 @@ def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_e
     ok = (tgt <= last_t) & frame["_y"].notna() & frame["_scale"].notna()
     if train_end_t is not None:
         ok &= tgt > train_end_t
-    past = frame[ok & (tgt > last_t - BIAS_WINDOW)]
+    past = frame[ok & (tgt > last_t - max(BIAS_WINDOW, COMMON_WINDOW))]
     if past.empty:
         return pd.Series(dtype=float)
-    g = pd.DataFrame({"station": past["station"].astype(int).to_numpy(),
-                      "y": past["_y"].to_numpy(), "p": predict(model, past)}).groupby("station")
-    sums = g[["y", "p"]].sum()[g.size() == BIAS_WINDOW]
-    ratio = sums["y"] / sums["p"].where(sums["p"] > 0)
-    return (1 + BIAS_SHRINK * (ratio.clip(*BIAS_CLIP) - 1)).fillna(1.0)
+    df = pd.DataFrame({"station": past["station"].astype(int).to_numpy(), "t": (past["_t"] + h).to_numpy(),
+                       "y": past["_y"].to_numpy(), "p": predict(model, past)})
+
+    def _ratio(window: int) -> pd.Series:
+        g = df[df["t"] > last_t - window].groupby("station")
+        sums = g[["y", "p"]].sum()[g.size() == window]
+        return sums["y"] / sums["p"].where(sums["p"] > 0)
+
+    stations = pd.Index(sorted(df["station"].unique()))
+    own = (1 + BIAS_SHRINK * (_ratio(BIAS_WINDOW).clip(*BIAS_CLIP) - 1)).reindex(stations).fillna(1.0)
+    pooled = _ratio(COMMON_WINDOW).dropna()
+    common = 1 + COMMON_SHRINK * (float(np.clip(pooled.median(), *COMMON_CLIP)) - 1) if len(pooled) else 1.0
+    return own * common
 
 
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
