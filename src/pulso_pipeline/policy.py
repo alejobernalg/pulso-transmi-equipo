@@ -58,8 +58,9 @@ def select_policy(database, model_id: str) -> tuple[str, str]:
     obs["station_id"] = obs["station_id"].str.strip()
     obs["observed_at"] = pd.to_datetime(obs["observed_at"], utc=True)
     m = comp.merge(obs.rename(columns={"observed_at": "target_at", "demand": "y"}), on=["station_id", "target_at"])
-    complete = m.groupby("cycle_id").size() == comp.groupby("cycle_id").size().reindex(m["cycle_id"].unique())
-    cycles = sorted(complete[complete].index)[-WINDOW_CYCLES:]
+    got = m.groupby("cycle_id").size()
+    expected = comp.groupby("cycle_id").size().reindex(got.index)
+    cycles = sorted(got[got == expected].index)[-WINDOW_CYCLES:]  # solo ciclos observados por completo
     m = m[m["cycle_id"].isin(cycles)]
     for c in ("r_own", "r_common", "r_now"):
         m[c] = pd.to_numeric(m[c], errors="coerce")

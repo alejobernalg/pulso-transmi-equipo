@@ -241,3 +241,47 @@ def test_policy_scores_reward_the_policy_that_follows_a_surge() -> None:
     assert s["reactiva"] > s["estandar"] > s["tranquila"]
     comp_nan = comp.assign(r_own=_np.nan, r_common=_np.nan, r_now=_np.nan)
     assert len(set(pol.policy_scores(comp_nan).values())) == 1  # sin razones, todas dan lo mismo
+
+
+class _FakeQuery:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def select(self, *_a):
+        return self
+
+    def eq(self, *_a):
+        return self
+
+    def order(self, *_a, **_k):
+        return self
+
+    def limit(self, *_a):
+        return self
+
+    def in_(self, *_a):
+        return self
+
+    def execute(self):
+        return type("R", (), {"data": self.rows})()
+
+
+class _FakeDB:
+    def __init__(self, tables):
+        self.tables = tables
+
+    def table(self, name):
+        return _FakeQuery(self.tables[name])
+
+
+def test_select_policy_end_to_end_ignores_incomplete_cycles() -> None:
+    comp, obs = [], []
+    for c in range(pol.WINDOW_CYCLES + 1):  # el último ciclo no está observado todavía
+        for s_id in ("a", "b"):
+            t = f"2026-09-18T{c:02d}:15:00+00:00"
+            comp.append({"cycle_id": f"cyc_{c:02d}", "station_id": s_id, "target_at": t, "horizon_steps": 1,
+                         "base": 100.0, "r_own": 2.0, "r_common": 2.0, "r_now": 2.0})
+            if c < pol.WINDOW_CYCLES:
+                obs.append({"station_id": s_id, "observed_at": t, "demand": 200.0})
+    name, reason = pol.select_policy(_FakeDB({"prediction_components": comp, "observations": obs}), "m")
+    assert name == "nowcast" and f"en {pol.WINDOW_CYCLES} ciclos" in reason
