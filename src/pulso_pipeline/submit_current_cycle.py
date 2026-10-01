@@ -376,7 +376,9 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:  # noqa: BLE001
                 print(f"aviso: no se pudieron guardar los componentes ({exc})")
             db.finish_run(database, run_id, status="success", decision="keep",
-                          decision_reason=f"submitted | política {policy_name}", data_cutoff=cutoff)
+                          decision_reason=f"submitted | política {policy_name} | "
+                                          f"{preds.attrs.get('expert_reason', 'experto champion')}",
+                          data_cutoff=cutoff)
             print(f"entregado: {cycle['cycle_id']} -> {receipt.get('submission_id')}")
             try:  # el modelo en sombra predice el mismo ciclo, sin enviar
                 shadow.predict_shadow(database, cycle, y, ctx, stations, targets, model_row["model_id"],

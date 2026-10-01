@@ -755,6 +755,9 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 #     promedio de las últimas K oscilaciones (K <= `CYCLE_MAX_PERIODS`). Copiar una sola
 #     oscilación arrastra su ruido; al madurar el régimen promediar más gana (18-sep 18 h:
 #     93.1 con K=3 vs 91.1 con K=1) y el selector va subiendo K solo;
+#   - "periodica" / "periodicaxK": lo mismo con el periodo dominante detectado en las últimas
+#     4 h (`detect_period`), por si un cambio futuro trae otra oscilación. En el replay detecta
+#     16 desde las 10 h del 18-sep sin saberlo de antemano y no cambia nada en días normales;
 #   - "adaptativo": Extra Trees reentrenado en cada ciclo con las últimas `ONLINE_WINDOW`
 #     horas-cuarto y solo rezagos recientes, así aprende cualquier forma nueva en horas.
 # El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
@@ -766,6 +769,8 @@ ONLINE_SEASONAL = (16, 32, 48, 96)
 ONLINE_SCALE = DAY                 # nivel de la estación: media de las últimas 24 h
 EXPERT_SCORE_CYCLES = 2            # ciclos anteriores (4 objetivos cada uno) para puntuar
 EXPERT_MARGIN = 3.0
+PERIOD_RANGE = range(8, 49)        # 2 h a 12 h
+PERIOD_WINDOW = 16                 # objetivos recientes con los que se elige el periodo
 
 
 def _wape_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -773,6 +778,15 @@ def _wape_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     err, tot = np.nansum(np.abs(y_true - y_pred), axis=0), np.nansum(y_true, axis=0)
     ok = tot > 0
     return float(np.clip(100 * (1 - err[ok] / tot[ok]), 0, None).mean()) if ok.any() else np.nan
+
+
+def detect_period(Y: np.ndarray, origin_t: int) -> int:
+    """Periodo P (en cuartos de hora) para el que y[t-P] mejor explica los últimos
+    `PERIOD_WINDOW` objetivos observados hasta `origin_t`."""
+    win = np.arange(origin_t - PERIOD_WINDOW + 1, origin_t + 1)
+    scores = {P: _wape_accuracy(Y[win], Y[win - P]) for P in PERIOD_RANGE}
+    scores = {P: v for P, v in scores.items() if np.isfinite(v)}
+    return max(scores, key=scores.get) if scores else CYCLE_PERIOD
 
 
 def _online_features(Y: np.ndarray, origins, h: int) -> tuple[np.ndarray, np.ndarray]:
@@ -835,20 +849,24 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
         comps = _champion_components(models, y.iloc[:origin_t + 1], ctx.iloc[:origin_t + 1], stations,
                                      horizons, train_end_t, policy)
         return {h: c["value"].to_numpy(dtype=float) for h, c in comps.items()}
-    if name.startswith("ciclica16"):
+    if name.startswith(("ciclica16", "periodica")):
+        period = CYCLE_PERIOD if name.startswith("ciclica16") else detect_period(Y, origin_t)
         k = int(name.split("x")[1]) if "x" in name else 1
-        return {h: np.mean([Y[origin_t + h - CYCLE_PERIOD * j] for j in range(1, k + 1)], axis=0) for h in horizons}
+        return {h: np.mean([Y[origin_t + h - period * j] for j in range(1, k + 1)], axis=0) for h in horizons}
     return adaptive_forecast(Y, origin_t, horizons)
 
 
-EXPERTS = ("champion", "adaptativo", "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
+EXPERTS = ("champion", "adaptativo",
+           "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
+           "periodica", *(f"periodicax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
 
 
 def select_expert(models, y, ctx, stations, Y: np.ndarray, train_end_t, policy) -> tuple[str, str, dict]:
     """Experto para el ciclo actual según la accuracy en los `EXPERT_SCORE_CYCLES` ciclos previos."""
     last_t = len(y) - 1
     hs = sorted(models)
-    min_hist = max(ONLINE_SCALE + max(ONLINE_SEASONAL) + ONLINE_WINDOW, CYCLE_PERIOD * CYCLE_MAX_PERIODS) \
+    min_hist = max(ONLINE_SCALE + max(ONLINE_SEASONAL) + ONLINE_WINDOW, max(PERIOD_RANGE) * CYCLE_MAX_PERIODS
+                   + PERIOD_WINDOW) \
         + 4 * EXPERT_SCORE_CYCLES
     if last_t < min_hist or not all(h in models for h in (1, 2, 3, 4)):
         return "champion", "historia insuficiente para puntuar expertos: champion", {}
@@ -864,7 +882,7 @@ def select_expert(models, y, ctx, stations, Y: np.ndarray, train_end_t, policy) 
                 scores[e].append(np.nan)
     mean = {e: float(np.mean(v)) if np.isfinite(v).all() else np.nan for e, v in scores.items()}
     valid = {e: v for e, v in mean.items() if np.isfinite(v)}
-    summary = ", ".join(f"{e} {v:.1f}" for e, v in sorted(valid.items(), key=lambda kv: -kv[1]))
+    summary = f"periodo {detect_period(Y, last_t)}; " + ", ".join(f"{e} {v:.1f}" for e, v in sorted(valid.items(), key=lambda kv: -kv[1]))
     if not np.isfinite(mean["champion"]):
         best = max(valid, key=valid.get) if valid else "champion"
         return best, f"experto {best} (champion sin puntaje; {summary})", mean
@@ -913,6 +931,8 @@ def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stati
     except Exception as exc:  # noqa: BLE001 - ante cualquier duda, el champion
         expert, reason = "champion", f"champion (no se pudo puntuar expertos: {exc})"
     print(reason)
+    if len(reason) > 400:  # el registro guarda el resumen; los peores expertos sobran
+        reason = reason[:397] + "..."
     preds_by_h = _champion_components(models, y, ctx, stations, hs, train_end_t, policy)
     if expert != "champion":
         vals = _expert_values(expert, models, y, ctx, stations, Y, len(y) - 1, hs, train_end_t, policy)
@@ -932,4 +952,6 @@ def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stati
         rows.append({"station_id": station_id, "target_at": target_at, "horizon_steps": h,
                      "value": round(float(c["value"]), 2), "base": float(c["base"]),
                      "r_own": float(c["r_own"]), "r_common": float(c["r_common"]), "r_now": float(c["r_now"])})
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    out.attrs["expert"], out.attrs["expert_reason"] = expert, reason  # evidencia de la decisión
+    return out
