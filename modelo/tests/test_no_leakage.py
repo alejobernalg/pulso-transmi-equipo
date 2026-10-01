@@ -89,13 +89,21 @@ def test_level_shift_detected_and_aligned(monkeypatch):
     y2.loc[y2.index >= start, sid] *= 2.5
     shifts = pm.detect_level_shifts(y2)
     assert set(shifts) == {sid}
-    # el salto empieza a medianoche y las horas sin volumen no cuentan: el corte cae en la
-    # hora con volumen más cercana (antes o después)
-    assert abs(shifts[sid][-1] - start) <= pd.Timedelta(hours=6)
+    assert abs(shifts[sid][-1] - start) <= pd.Timedelta(hours=2)
     aligned = pm.align_level_shifts(y2)
     before = aligned.index < start - pd.Timedelta(hours=2)
     ratio = aligned.loc[before, sid].sum() / y.loc[before, sid].sum()
     assert ratio == pytest.approx(2.5, rel=0.1)
     pd.testing.assert_frame_equal(aligned.drop(columns=sid), y2.drop(columns=sid))
     assert pm.detect_level_shifts(y) == {}
+
+
+def test_night_surge_is_not_a_level_shift(monkeypatch):
+    """Una oleada de madrugada (x4 durante unas horas nocturnas) no se toma por un escalón."""
+    monkeypatch.setattr(pm, "COMPETITION_START", y.index[-8 * pm.DAY])
+    local = y.index.tz_convert(pm.TZ)
+    night = (y.index > y.index[-pm.DAY]) & ((local.hour >= 23) | (local.hour < 4))
+    y2 = y.copy()
+    y2.loc[night, y.columns[0]] *= 4
+    assert pm.detect_level_shifts(y2.loc[: y.index[night][-1]]) == {}
 

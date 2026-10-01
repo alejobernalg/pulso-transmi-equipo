@@ -171,10 +171,13 @@ LEVEL_MAX_BEFORE = 24            # bloques de referencia antes del quiebre
 LEVEL_MIN_CHANGE = np.log(1.35)  # cambio mínimo de nivel (log)
 LEVEL_MIN_Z = 5.0                # separación mínima (estadístico t de dos tramos)
 LEVEL_LOOKBACK = pd.Timedelta(days=7)  # el nivel se mide desde 7 días antes de la competencia
-LEVEL_MIN_BASE_SHARE = 0.5      # bloques con perfil < 50 % de la mediana de la estación no cuentan
-# Tras un escalón real el nivel queda estable (Américas 16-sep: log-std ~0.07); las oleadas
-# nocturnas del 18-sep saltan x2-x10 entre horas (log-std > 0.4) y no son un régimen nuevo.
-LEVEL_MAX_AFTER_STD = 0.25
+# Un quiebre solo cuenta si el tramo nuevo tiene al menos LEVEL_MIN_AFTER horas diurnas. El
+# 18-sep de madrugada hubo oleadas de x2-x10 sobre un perfil casi nulo que el detector tomaba
+# por escalones (5 estaciones a las 23 h) y habría reescalado su historia. Los escalones
+# reales (16-sep, 8-11 h) se detectan igual; uno nocturno se detectaría a la mañana siguiente.
+# Replay: 84.93 / 87.83 en las ventanas 11..14 y 14..18-sep (igual que sin la regla) y
+# ninguna estación marcada en falso durante las oleadas.
+LEVEL_DAY_HOURS = (5, 22)
 
 
 def _block_levels(y: pd.DataFrame) -> pd.DataFrame:
@@ -194,33 +197,24 @@ def _block_levels(y: pd.DataFrame) -> pd.DataFrame:
     blk = np.arange(len(yy)) // LEVEL_BLOCK
     num = yy.groupby(blk).sum(min_count=LEVEL_BLOCK)
     den = bb.groupby(blk).sum(min_count=LEVEL_BLOCK)
-    # solo horas con volumen: de madrugada el perfil es casi cero y una oleada da razones de
-    # x5-x10 que parecen quiebres (18-sep: 5 estaciones marcadas en falso a las 23 h)
-    busy = den.ge(LEVEL_MIN_BASE_SHARE * den.median())
     with np.errstate(divide="ignore", invalid="ignore"):
-        lv = np.log((num / den).where((num > 0) & (den > 0) & busy))
+        lv = np.log((num / den).where((num > 0) & (den > 0)))
     lv.index = yy.index[::LEVEL_BLOCK][: len(lv)]
     return lv
 
 
-def _mad(v: np.ndarray) -> float:
-    """Desviación robusta (MAD escalada): unas pocas horas atípicas no la inflan."""
-    return float(1.4826 * np.median(np.abs(v - np.median(v))))
-
-
-def _latest_level_break(x: np.ndarray) -> tuple[int, float, float] | None:
-    """Quiebre más reciente en la serie de log-nivel `x`: (índice, cambio, z) o None.
-    Usa medianas y MAD para que horas atípicas (oleadas) no muevan ni oculten un quiebre."""
+def _latest_level_break(x: np.ndarray, day: np.ndarray) -> tuple[int, float, float] | None:
+    """Quiebre más reciente en la serie de log-nivel `x` (`day`: bloque diurno): (índice,
+    cambio, z) o None."""
     best = None
     for tau in range(len(x) - LEVEL_MIN_AFTER, 0, -1):
         after, before = x[tau:], x[max(0, tau - LEVEL_MAX_BEFORE):tau]
         if len(before) < LEVEL_MIN_AFTER:
             break
-        if _mad(after) > LEVEL_MAX_AFTER_STD:  # un régimen nuevo es estable; una oleada no
+        if day[tau:].sum() < LEVEL_MIN_AFTER:
             continue
-        ma, mb = np.median(after), np.median(before)
-        diff = ma - mb
-        s = max(_mad(np.r_[after - ma, before - mb]), 1e-3)
+        diff = after.mean() - before.mean()
+        s = np.sqrt(np.var(np.r_[after - after.mean(), before - before.mean()]) + 1e-6)
         z = abs(diff) / (s * np.sqrt(1 / len(after) + 1 / len(before)))
         if abs(diff) > LEVEL_MIN_CHANGE and z > LEVEL_MIN_Z and (best is None or z > best[2]):
             best = (tau, float(diff), float(z))
@@ -237,8 +231,10 @@ def detect_level_shifts(y: pd.DataFrame) -> dict:
     for sid in y.columns:
         s = lv[sid].dropna()
         x, idx = s.to_numpy(), s.index
+        hour = idx.tz_convert(TZ).hour
+        day = np.asarray((hour >= LEVEL_DAY_HOURS[0]) & (hour < LEVEL_DAY_HOURS[1]))
         breaks, end = [], len(x)
-        while (b := _latest_level_break(x[:end])) is not None:
+        while (b := _latest_level_break(x[:end], day[:end])) is not None:
             breaks.append(idx[b[0]])
             end = b[0]
         if breaks:
@@ -255,7 +251,7 @@ def align_level_shifts(y: pd.DataFrame) -> pd.DataFrame:
     y = y.copy()
     for sid, breaks in shifts.items():
         edges = [y.index[0], *breaks, y.index[-1] + pd.Timedelta(minutes=STEP_MIN)]
-        levels = [np.exp(lv[sid][(lv.index >= a) & (lv.index < b)].median()) for a, b in zip(edges[:-1], edges[1:])]
+        levels = [np.exp(lv[sid][(lv.index >= a) & (lv.index < b)].mean()) for a, b in zip(edges[:-1], edges[1:])]
         for a, b, lvl in zip(edges[:-2], edges[1:-1], levels[:-1]):
             seg = (y.index >= a) & (y.index < b)
             y.loc[seg, sid] = y.loc[seg, sid] * (levels[-1] / lvl)
