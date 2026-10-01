@@ -62,7 +62,8 @@ def test_bias_correction_only_uses_observed_targets(h):
     dirty = pm.recent_bias_factors(model, pm.make_frame(y2, ctx, stations, h), h, t, train_end_t=t - 200)
     assert len(base) == len(stations)
     pd.testing.assert_series_equal(base, dirty)
-    assert base.between(*pm.BREAK_CLIP).all()
+    lo, hi = (1 + pm.BIAS_SHRINK * (c - 1) for c in pm.BIAS_CLIP)
+    assert base.between(lo, hi).all()
 
 
 def test_peak_shift_detected_and_aligned(monkeypatch):
@@ -88,7 +89,9 @@ def test_level_shift_detected_and_aligned(monkeypatch):
     y2.loc[y2.index >= start, sid] *= 2.5
     shifts = pm.detect_level_shifts(y2)
     assert set(shifts) == {sid}
-    assert abs(shifts[sid][-1] - start) <= pd.Timedelta(hours=2)
+    # el salto empieza a medianoche y las horas sin volumen no cuentan: el corte cae en la
+    # hora con volumen más cercana (antes o después)
+    assert abs(shifts[sid][-1] - start) <= pd.Timedelta(hours=6)
     aligned = pm.align_level_shifts(y2)
     before = aligned.index < start - pd.Timedelta(hours=2)
     ratio = aligned.loc[before, sid].sum() / y.loc[before, sid].sum()

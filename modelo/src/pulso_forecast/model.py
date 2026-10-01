@@ -160,7 +160,7 @@ def align_peak_shifts(y: pd.DataFrame) -> pd.DataFrame:
 # la corrección online de sesgo no alcanza a compensarlo. Se detecta cada quiebre sobre el
 # nivel horario (demanda / perfil previo a la competencia) y se reescala la historia anterior
 # al nivel del tramo actual, como `align_peak_shifts` hace con el horario del pico.
-# Replay en vivo (pulso_forecast.replay), junto con BREAK_CLIP ampliado: +0.95 pts en la
+# Replay en vivo (pulso_forecast.replay): +0.95 pts en la
 # ventana con quiebres (14..18-sep: Banderas +8.4, Américas +1.5, Ricaurte +0.9, Suba +0.6)
 # y -0.02 en la ventana sin quiebres grandes (11..14-sep), peor estación estable -0.15.
 # Umbrales elegidos entre tres calibraciones: los más laxos (3 h, x1.3, z 4) confundían el
@@ -171,6 +171,10 @@ LEVEL_MAX_BEFORE = 24            # bloques de referencia antes del quiebre
 LEVEL_MIN_CHANGE = np.log(1.35)  # cambio mínimo de nivel (log)
 LEVEL_MIN_Z = 5.0                # separación mínima (estadístico t de dos tramos)
 LEVEL_LOOKBACK = pd.Timedelta(days=7)  # el nivel se mide desde 7 días antes de la competencia
+LEVEL_MIN_BASE_SHARE = 0.5      # bloques con perfil < 50 % de la mediana de la estación no cuentan
+# Tras un escalón real el nivel queda estable (Américas 16-sep: log-std ~0.07); las oleadas
+# nocturnas del 18-sep saltan x2-x10 entre horas (log-std > 0.4) y no son un régimen nuevo.
+LEVEL_MAX_AFTER_STD = 0.25
 
 
 def _block_levels(y: pd.DataFrame) -> pd.DataFrame:
@@ -190,21 +194,33 @@ def _block_levels(y: pd.DataFrame) -> pd.DataFrame:
     blk = np.arange(len(yy)) // LEVEL_BLOCK
     num = yy.groupby(blk).sum(min_count=LEVEL_BLOCK)
     den = bb.groupby(blk).sum(min_count=LEVEL_BLOCK)
+    # solo horas con volumen: de madrugada el perfil es casi cero y una oleada da razones de
+    # x5-x10 que parecen quiebres (18-sep: 5 estaciones marcadas en falso a las 23 h)
+    busy = den.ge(LEVEL_MIN_BASE_SHARE * den.median())
     with np.errstate(divide="ignore", invalid="ignore"):
-        lv = np.log((num / den).where((num > 0) & (den > 0)))
+        lv = np.log((num / den).where((num > 0) & (den > 0) & busy))
     lv.index = yy.index[::LEVEL_BLOCK][: len(lv)]
     return lv
 
 
+def _mad(v: np.ndarray) -> float:
+    """Desviación robusta (MAD escalada): unas pocas horas atípicas no la inflan."""
+    return float(1.4826 * np.median(np.abs(v - np.median(v))))
+
+
 def _latest_level_break(x: np.ndarray) -> tuple[int, float, float] | None:
-    """Quiebre más reciente en la serie de log-nivel `x`: (índice, cambio, z) o None."""
+    """Quiebre más reciente en la serie de log-nivel `x`: (índice, cambio, z) o None.
+    Usa medianas y MAD para que horas atípicas (oleadas) no muevan ni oculten un quiebre."""
     best = None
     for tau in range(len(x) - LEVEL_MIN_AFTER, 0, -1):
         after, before = x[tau:], x[max(0, tau - LEVEL_MAX_BEFORE):tau]
         if len(before) < LEVEL_MIN_AFTER:
             break
-        diff = after.mean() - before.mean()
-        s = np.sqrt(np.var(np.r_[after - after.mean(), before - before.mean()]) + 1e-6)
+        if _mad(after) > LEVEL_MAX_AFTER_STD:  # un régimen nuevo es estable; una oleada no
+            continue
+        ma, mb = np.median(after), np.median(before)
+        diff = ma - mb
+        s = max(_mad(np.r_[after - ma, before - mb]), 1e-3)
         z = abs(diff) / (s * np.sqrt(1 / len(after) + 1 / len(before)))
         if abs(diff) > LEVEL_MIN_CHANGE and z > LEVEL_MIN_Z and (best is None or z > best[2]):
             best = (tau, float(diff), float(z))
@@ -239,7 +255,7 @@ def align_level_shifts(y: pd.DataFrame) -> pd.DataFrame:
     y = y.copy()
     for sid, breaks in shifts.items():
         edges = [y.index[0], *breaks, y.index[-1] + pd.Timedelta(minutes=STEP_MIN)]
-        levels = [np.exp(lv[sid][(lv.index >= a) & (lv.index < b)].mean()) for a, b in zip(edges[:-1], edges[1:])]
+        levels = [np.exp(lv[sid][(lv.index >= a) & (lv.index < b)].median()) for a, b in zip(edges[:-1], edges[1:])]
         for a, b, lvl in zip(edges[:-2], edges[1:-1], levels[:-1]):
             seg = (y.index >= a) & (y.index < b)
             y.loc[seg, sid] = y.loc[seg, sid] * (levels[-1] / lvl)
@@ -529,7 +545,7 @@ def run_from_frames(y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame, 
 # Periodos finales que el modelo de producción NO ve al entrenar: así la corrección
 # de sesgo (que solo usa objetivos posteriores al corte) tiene ventana completa desde
 # el primer ciclo tras un reentrenamiento, en vez de quedar apagada 2-4 ciclos.
-PRODUCTION_HOLDOUT = 20  # = BREAK_WINDOW + max(HORIZONS)
+PRODUCTION_HOLDOUT = 20  # > BIAS_WINDOW + max(HORIZONS); se conserva el valor validado
 
 
 def production_train_end(n_t: int) -> int:
@@ -590,16 +606,11 @@ def forecast_next(models: dict, horizons=None, data_dir=None) -> pd.DataFrame:
 BIAS_WINDOW = 8     # últimos 8 objetivos ya observados (2 h) por estación
 BIAS_SHRINK = 0.5   # se aplica la mitad del sesgo medido
 BIAS_CLIP = (0.7, 1.3)
-# quiebre de nivel: si el sesgo de 8 y de 16 periodos coincide en signo y ambos
-# superan este umbral relativo, la estación cambió de régimen (p. ej. Banderas
-# cayó a la mitad el 13-sep) y se corrige completo con un rango amplio
-BREAK_WINDOW = 16
-BREAK_THRESHOLD = 0.2
-# Rango ampliado de (0.3, 2.0): el 16-sep Portal Américas subió x2.5 y Banderas bajó a
-# x0.4 otra vez, y el factor quedaba topado en el límite. Replay (pulso_forecast.replay)
-# sobre dos ventanas en vivo: +0.19 pts en la ventana con esos quiebres (Américas +1.36,
-# Banderas +0.9), neutral en la otra (-0.003) y ninguna estación estable baja más de 0.03.
-BREAK_CLIP = (0.2, 3.0)
+# Antes había un "modo quiebre" que aplicaba el sesgo completo (hasta x3) cuando las
+# ventanas de 2 h y 4 h coincidían. Con `align_level_shifts` los escalones ya se corrigen
+# en la historia, y ese modo solo amplificaba oleadas pasajeras: el 18-sep de madrugada
+# multiplicaba la predicción justo cuando la oleada ya había bajado. Replay sin él: 35.6 ->
+# 41.9 en esa madrugada, -0.04/-0.05 en las ventanas de escalones del 11..18-sep.
 
 
 def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_end_t: int | None = None) -> pd.Series:
@@ -617,22 +628,14 @@ def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_e
     ok = (tgt <= last_t) & frame["_y"].notna() & frame["_scale"].notna()
     if train_end_t is not None:
         ok &= tgt > train_end_t
-    past = frame[ok & (tgt > last_t - max(BIAS_WINDOW, BREAK_WINDOW))]
+    past = frame[ok & (tgt > last_t - BIAS_WINDOW)]
     if past.empty:
         return pd.Series(dtype=float)
-    df = pd.DataFrame({"station": past["station"].astype(int).to_numpy(), "t": (past["_t"] + h).to_numpy(),
-                       "y": past["_y"].to_numpy(), "p": predict(model, past)})
-
-    def _ratio(window: int) -> pd.Series:
-        g = df[df["t"] > last_t - window].groupby("station")
-        sums = g[["y", "p"]].sum()[g.size() == window]
-        return sums["y"] / sums["p"].where(sums["p"] > 0)
-
-    short, long = _ratio(BIAS_WINDOW), _ratio(BREAK_WINDOW).reindex(_ratio(BIAS_WINDOW).index)
-    factor = 1 + BIAS_SHRINK * (short.clip(*BIAS_CLIP) - 1)
-    brk = ((short - 1).abs() > BREAK_THRESHOLD) & ((long - 1).abs() > BREAK_THRESHOLD) & (np.sign(short - 1) == np.sign(long - 1))
-    factor[brk] = short[brk].clip(*BREAK_CLIP)
-    return factor.fillna(1.0)
+    g = pd.DataFrame({"station": past["station"].astype(int).to_numpy(),
+                      "y": past["_y"].to_numpy(), "p": predict(model, past)}).groupby("station")
+    sums = g[["y", "p"]].sum()[g.size() == BIAS_WINDOW]
+    ratio = sums["y"] / sums["p"].where(sums["p"] > 0)
+    return (1 + BIAS_SHRINK * (ratio.clip(*BIAS_CLIP) - 1)).fillna(1.0)
 
 
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,

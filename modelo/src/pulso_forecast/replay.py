@@ -79,20 +79,10 @@ def collect(models: dict, y_raw: pd.DataFrame, ctx: pd.DataFrame, stations: pd.D
 # --------------------------------------------------------------- reglas de nivel
 def production_rule(g: pd.DataFrame) -> float:
     """Réplica de `recent_bias_factors` para un (origen, estación, horizonte)."""
-    def ratio(window: int) -> float:
-        w = g[g["age"] <= window]
-        if len(w) != window or w["p"].sum() <= 0:
-            return np.nan
-        return w["y"].sum() / w["p"].sum()
-
-    short, long = ratio(M.BIAS_WINDOW), ratio(M.BREAK_WINDOW)
-    if np.isnan(short):
+    w = g[g["age"] <= M.BIAS_WINDOW]
+    if len(w) != M.BIAS_WINDOW or w["p"].sum() <= 0:
         return 1.0
-    factor = 1 + M.BIAS_SHRINK * (np.clip(short, *M.BIAS_CLIP) - 1)
-    if (not np.isnan(long) and abs(short - 1) > M.BREAK_THRESHOLD and abs(long - 1) > M.BREAK_THRESHOLD
-            and np.sign(short - 1) == np.sign(long - 1)):
-        factor = float(np.clip(short, *M.BREAK_CLIP))
-    return float(factor)
+    return float(1 + M.BIAS_SHRINK * (np.clip(w["y"].sum() / w["p"].sum(), *M.BIAS_CLIP) - 1))
 
 
 def apply_rule(preds: pd.DataFrame, resid: pd.DataFrame, rule: Callable[[pd.DataFrame], float]) -> pd.DataFrame:
