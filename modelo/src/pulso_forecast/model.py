@@ -758,8 +758,9 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 #   - "periodica" / "periodicaxK": lo mismo con el periodo dominante detectado en las últimas
 #     4 h (`detect_period`), por si un cambio futuro trae otra oscilación. En el replay detecta
 #     16 desde las 10 h del 18-sep sin saberlo de antemano y no cambia nada en días normales;
-#   - "adaptativo": Extra Trees reentrenado en cada ciclo con las últimas `ONLINE_WINDOW`
-#     horas-cuarto y solo rezagos recientes, así aprende cualquier forma nueva en horas.
+#   - "adaptativo" / "adaptativo6h": Extra Trees reentrenado en cada ciclo con las últimas 12 h
+#     (`ONLINE_WINDOW`) o 6 h y solo rezagos recientes, así aprende cualquier forma nueva en
+#     horas. El de 6 h se recupera antes tras un cambio (18-sep 10-11 h: 86-91 vs 71-72).
 # El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
 CYCLE_PERIOD = 16
 CYCLE_MAX_PERIODS = 6
@@ -768,6 +769,10 @@ ONLINE_LAGS = (*range(24), 28, 32, 40, 48)
 ONLINE_SEASONAL = (16, 32, 48, 96)
 ONLINE_SCALE = DAY                 # nivel de la estación: media de las últimas 24 h
 EXPERT_SCORE_CYCLES = 2            # ciclos anteriores (4 objetivos cada uno) para puntuar
+# El ciclo más reciente pesa más: tras un cambio se suelta antes el experto que dejó de
+# servir. Replay: +1.1 en la transición del 18-sep, días normales iguales (84.34).
+EXPERT_SCORE_WEIGHTS = (0.7, 0.3)
+ONLINE_FAST_WINDOW = 24
 EXPERT_MARGIN = 3.0
 PERIOD_RANGE = range(8, 49)        # 2 h a 12 h
 PERIOD_WINDOW = 16                 # objetivos recientes con los que se elige el periodo
@@ -804,12 +809,12 @@ def _online_features(Y: np.ndarray, origins, h: int) -> tuple[np.ndarray, np.nda
     return np.nan_to_num(np.concatenate(X)), np.concatenate(S)
 
 
-def adaptive_forecast(Y: np.ndarray, origin_t: int, horizons) -> dict[int, np.ndarray]:
+def adaptive_forecast(Y: np.ndarray, origin_t: int, horizons, window: int = ONLINE_WINDOW) -> dict[int, np.ndarray]:
     """{h: predicción por estación} del experto adaptativo, entrenado solo con objetivos <= origen."""
     from sklearn.ensemble import ExtraTreesRegressor
     out = {}
     for h in horizons:
-        train_origins = np.arange(origin_t - ONLINE_WINDOW, origin_t - h + 1)
+        train_origins = np.arange(origin_t - window, origin_t - h + 1)
         X, sc = _online_features(Y, train_origins, h)
         target = np.concatenate([Y[t + h] for t in train_origins]) / sc
         ok = np.isfinite(target)
@@ -853,10 +858,12 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
         period = CYCLE_PERIOD if name.startswith("ciclica16") else detect_period(Y, origin_t)
         k = int(name.split("x")[1]) if "x" in name else 1
         return {h: np.mean([Y[origin_t + h - period * j] for j in range(1, k + 1)], axis=0) for h in horizons}
+    if name == "adaptativo6h":
+        return adaptive_forecast(Y, origin_t, horizons, window=ONLINE_FAST_WINDOW)
     return adaptive_forecast(Y, origin_t, horizons)
 
 
-EXPERTS = ("champion", "adaptativo",
+EXPERTS = ("champion", "adaptativo", "adaptativo6h",
            "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
            "periodica", *(f"periodicax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
 
@@ -880,7 +887,8 @@ def select_expert(models, y, ctx, stations, Y: np.ndarray, train_end_t, policy) 
                 scores[e].append(_wape_accuracy(truth, np.stack([vals[h] for h in hs])))
             except Exception:  # noqa: BLE001 - un experto que falla no compite
                 scores[e].append(np.nan)
-    mean = {e: float(np.mean(v)) if np.isfinite(v).all() else np.nan for e, v in scores.items()}
+    w = np.asarray(EXPERT_SCORE_WEIGHTS[:EXPERT_SCORE_CYCLES])
+    mean = {e: float(np.dot(w, v) / w.sum()) if np.isfinite(v).all() else np.nan for e, v in scores.items()}
     valid = {e: v for e, v in mean.items() if np.isfinite(v)}
     summary = f"periodo {detect_period(Y, last_t)}; " + ", ".join(f"{e} {v:.1f}" for e, v in sorted(valid.items(), key=lambda kv: -kv[1]))
     if not np.isfinite(mean["champion"]):
