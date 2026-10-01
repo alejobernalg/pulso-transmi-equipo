@@ -147,13 +147,13 @@ def evaluate_shadow(database) -> str | None:
 
 # ------------------------------------------------------------ predicción en sombra
 def predict_shadow(database, cycle: dict, y, ctx, stations, targets: list, champion_id: str,
-                   policy: dict | None = None) -> None:
+                   policy: dict | None = None, y_raw=None) -> None:
     for sh_model in db.get_shadow_models(database):
         if sh_model["model_id"] == champion_id:
             continue
         bundle = joblib.load(BytesIO(db.download_model(database, sh_model["artifact_uri"])))
         preds = forecast_for_targets(bundle["models"], y, ctx, stations, cycle["data_cutoff"], targets,
-                                     train_cutoff=bundle["meta"].get("data_cutoff"), policy=policy)
+                                     train_cutoff=bundle["meta"].get("data_cutoff"), policy=policy, y_raw=y_raw)
         db.save_shadow_predictions(database, [
             {"cycle_id": cycle["cycle_id"], "model_id": sh_model["model_id"], "station_id": r.station_id,
              "target_at": r.target_at.isoformat(), "horizon_steps": int(r.horizon_steps), "y_pred": float(r.value),

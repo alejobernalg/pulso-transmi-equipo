@@ -22,6 +22,7 @@ from io import BytesIO
 import joblib
 
 from pulso_forecast import forecast_for_targets, wide_from_frames
+from pulso_forecast.model import raw_wide_from_frames
 from pulso_forecast.model import DEFAULT_POLICY_NAME, POLICIES
 from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient, PulsoTransmiError
 
@@ -253,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             cutoff = cycle["data_cutoff"]
             y = y.loc[:cutoff]
             ctx = ctx.loc[:cutoff]
+            y_raw = raw_wide_from_frames(obs_df, ctx_df, stations_df)[0].loc[:cutoff]
 
             targets = [(t["station_id"], t["target_at"]) for t in cycle["targets"]]
             try:  # política de corrección según el desempeño reciente (pulso_pipeline.policy)
@@ -262,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"política: {policy_reason}")
             preds = forecast_for_targets(bundle["models"], y, ctx, stations, cutoff, targets,
                                          train_cutoff=bundle["meta"].get("data_cutoff"),
-                                         policy=POLICIES[policy_name])
+                                         policy=POLICIES[policy_name], y_raw=y_raw)
 
             if len(preds) != cycle["expected_predictions"]:
                 raise ValueError(
@@ -378,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"entregado: {cycle['cycle_id']} -> {receipt.get('submission_id')}")
             try:  # el modelo en sombra predice el mismo ciclo, sin enviar
                 shadow.predict_shadow(database, cycle, y, ctx, stations, targets, model_row["model_id"],
-                                      POLICIES[policy_name])
+                                      POLICIES[policy_name], y_raw=y_raw)
             except Exception as exc:  # noqa: BLE001
                 print(f"aviso: no se pudo predecir con el modelo en sombra ({exc})")
             return 0

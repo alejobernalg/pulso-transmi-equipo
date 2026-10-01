@@ -744,8 +744,55 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
     return (g["y"] / g["p"].where(g["p"] > 0)).clip(*NOWCAST_CLIP).dropna()
 
 
+# Régimen cíclico: desde el 18-sep ~05 h UTC la demanda dejó el perfil diario y pasó a una
+# oscilación limpia de 4 h (16 periodos) con fase propia por estación; el modelo (perfiles
+# diarios) cayó a ~40 % por ciclo. Antes de cada ciclo se mide, en los últimos
+# `CYCLE_GATE_WINDOW` objetivos ya observados, el modelo a +15 min contra y[t-16]; si la
+# estacional gana por más de `CYCLE_GATE_MARGIN` puntos se usa y[t+h-16] en ese ciclo.
+# Simulado sobre los 182 ciclos enviados (10-sep..18-sep): 0 activaciones en los 172 ciclos
+# normales y ~90 vs ~40 en los del régimen nuevo (83.71 vs 81.13 en total).
+CYCLE_PERIOD = 16
+CYCLE_GATE_WINDOW = 8
+CYCLE_GATE_MARGIN = 5.0
+
+
+def _wape_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Métrica del reto sobre matrices (objetivos x estaciones)."""
+    err, tot = np.nansum(np.abs(y_true - y_pred), axis=0), np.nansum(y_true, axis=0)
+    ok = tot > 0
+    return float(np.clip(100 * (1 - err[ok] / tot[ok]), 0, None).mean()) if ok.any() else np.nan
+
+
+def cyclic_regime_active(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
+                         y_raw: pd.DataFrame | None = None) -> tuple[bool, str]:
+    """¿La estacional de `CYCLE_PERIOD` le gana claramente al modelo en los últimos objetivos?
+    Solo usa datos <= origen (los objetivos de la ventana ya se observaron). `y_raw` es la
+    demanda sin alinear (los detectores de quiebre pueden reescalar las últimas horas)."""
+    if 1 not in models or len(y) < CYCLE_PERIOD + CYCLE_GATE_WINDOW + 1:
+        return False, "sin datos para evaluar el régimen cíclico"
+    last_t = len(y) - 1
+    ext_idx = y.index.append(pd.date_range(y.index[-1] + pd.Timedelta(minutes=STEP_MIN), periods=1,
+                                           freq=f"{STEP_MIN}min"))
+    frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, 1)
+    tgt = frame["_t"] + 1
+    past = frame[(tgt <= last_t) & (tgt > last_t - CYCLE_GATE_WINDOW) & frame["_scale"].notna()]
+    if past["_t"].nunique() < CYCLE_GATE_WINDOW:
+        return False, "ventana incompleta para el régimen cíclico"
+    n_s = y.shape[1]
+    order = np.argsort(past["_t"].to_numpy() * n_s + past["station"].astype(int).to_numpy(), kind="stable")
+    model_pred = predict(models[1], past)[order].reshape(CYCLE_GATE_WINDOW, n_s)
+    win = np.arange(last_t - CYCLE_GATE_WINDOW + 1, last_t + 1)
+    y_np = (y if y_raw is None else y_raw).reindex(index=y.index, columns=y.columns).to_numpy(dtype=float)
+    acc_model = _wape_accuracy(y_np[win], model_pred)
+    acc_cycle = _wape_accuracy(y_np[win], y_np[win - CYCLE_PERIOD])
+    active = bool(np.isfinite(acc_cycle) and np.isfinite(acc_model) and acc_cycle > acc_model + CYCLE_GATE_MARGIN)
+    return active, f"régimen cíclico {'ACTIVO' if active else 'inactivo'} (estacional {CYCLE_PERIOD}: " \
+                   f"{acc_cycle:.1f} vs modelo {acc_model:.1f} en los últimos {CYCLE_GATE_WINDOW} objetivos)"
+
+
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
-                          origin, targets, train_cutoff=None, policy: dict | None = None) -> pd.DataFrame:
+                          origin, targets, train_cutoff=None, policy: dict | None = None,
+                          y_raw: pd.DataFrame | None = None) -> pd.DataFrame:
     """Predice exactamente los pares (station_id, target_at) que pide un ciclo.
 
     `origin` es el `data_cutoff` del ciclo (debe ser el último índice de `y`).
@@ -776,7 +823,17 @@ def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stati
     if train_cutoff is not None:
         train_end_t = int(y.index.searchsorted(pd.Timestamp(train_cutoff), side="right")) - 1
     now = nowcast_ratios(models, y, ctx, stations, train_end_t) if 1 in models else pd.Series(dtype=float)
+    cyclic, cyclic_reason = cyclic_regime_active(models, y, ctx, stations, y_raw)
+    print(cyclic_reason)
+    y_season = (y if y_raw is None else y_raw).reindex(index=y.index, columns=stations.index)
     for h in by_h:
+        seasonal = y_season.iloc[len(y) - 1 + h - CYCLE_PERIOD].to_numpy(dtype=float)
+        if cyclic and np.isfinite(seasonal).all():  # sin corrección: razones NaN -> factor 1 en toda política
+            nan = np.full(len(stations), np.nan)
+            comp = pd.DataFrame({"base": seasonal, "r_own": nan, "r_common": nan, "r_now": nan}, index=stations.index)
+            comp["value"] = comp["base"].clip(lower=0)
+            preds_by_h[h] = comp
+            continue
         ext_idx = y.index.append(pd.date_range(origin + pd.Timedelta(minutes=STEP_MIN), periods=h,
                                                freq=f"{STEP_MIN}min"))
         frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, h)
