@@ -274,9 +274,11 @@ probar el camino completo sin gastar intentos reales de la competencia.
 **Reentrenamiento automático con evaluación en sombra** (`pulso_pipeline.shadow`, 2026-10-01):
 
 1. Después de cada corrida de `predict.yml` se guarda una foto del leaderboard
-   (`leaderboard_snapshots`). Si el puesto en `rolling_24h` está 3 o más por debajo del
-   acumulado, se dispara `train.yml` con `--mode shadow` (salvo que ya haya una sombra
-   pendiente o se haya disparado hace menos de 2 h).
+   (`leaderboard_snapshots`). Se dispara `train.yml` con `--mode shadow` si el puesto en
+   `rolling_24h` está 3 o más por debajo del acumulado, **o** si los últimos 3 ciclos
+   calificados quedaron más de 10 puntos bajo la validación del champion (el drift que
+   golpea a todos por igual no mueve el ranking). No se dispara si ya hay una sombra
+   pendiente o si se disparó hace menos de 2 h.
 2. El candidato queda en etapa `shadow` (`model_versions.stage`): predice cada ciclo junto
    al champion pero no se envía (`shadow_predictions`).
 3. Con 4 ciclos ya observados, ambos se comparan en los mismos objetivos con la métrica del

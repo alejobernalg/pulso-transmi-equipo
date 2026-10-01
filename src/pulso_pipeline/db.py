@@ -156,6 +156,13 @@ def set_stage(db: Client, model_id: str, stage: str) -> None:
     ).eq("model_id", model_id).execute()
 
 
+def validation_accuracy(db: Client, model_id: str) -> float | None:
+    """Accuracy de validación global del modelo (promedio de horizontes)."""
+    rows = (db.table("model_metrics").select("value").eq("model_id", model_id).eq("split", "validation")
+            .eq("metric_name", "accuracy").is_("station_id", "null").execute().data)
+    return sum(r["value"] for r in rows) / len(rows) if rows else None
+
+
 def get_shadow_model(db: Client) -> dict[str, Any] | None:
     rows = db.table("model_versions").select("*").eq("stage", "shadow").order("stage_changed_at", desc=True) \
         .limit(1).execute().data

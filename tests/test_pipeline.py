@@ -178,15 +178,23 @@ _NOW = _dt(2026, 10, 1, tzinfo=_tz.utc)
 
 
 def test_trigger_when_recent_rank_is_three_below_cumulative() -> None:
-    assert sh.should_trigger(2, 5, False, None, _NOW)[0] is True
-    assert sh.should_trigger(2, 4, False, None, _NOW)[0] is False
+    assert sh.drift_reasons(2, 5, [], None) and not sh.drift_reasons(2, 4, [], None)
+    assert sh.should_trigger(sh.drift_reasons(2, 5, [], None), False, None, _NOW)[0] is True
+
+
+def test_trigger_when_live_accuracy_drops_for_three_cycles() -> None:
+    assert sh.drift_reasons(2, 2, [70.0, 72.0, 74.0], 86.0)            # todos < 76
+    assert not sh.drift_reasons(2, 2, [70.0, 80.0, 74.0], 86.0)        # uno no cae
+    assert not sh.drift_reasons(2, 2, [70.0, 72.0], 86.0)              # faltan ciclos
+    assert not sh.drift_reasons(None, None, [50.0, 50.0, 50.0], None)  # sin referencia
 
 
 def test_trigger_blocked_by_pending_shadow_or_cooldown() -> None:
-    assert sh.should_trigger(2, 6, True, None, _NOW)[0] is False
-    assert sh.should_trigger(2, 6, False, _NOW - _td(minutes=30), _NOW)[0] is False
-    assert sh.should_trigger(2, 6, False, _NOW - _td(hours=3), _NOW)[0] is True
-    assert sh.should_trigger(None, 6, False, None, _NOW)[0] is False
+    r = ["drift"]
+    assert sh.should_trigger(r, True, None, _NOW)[0] is False
+    assert sh.should_trigger(r, False, _NOW - _td(minutes=30), _NOW)[0] is False
+    assert sh.should_trigger(r, False, _NOW - _td(hours=3), _NOW)[0] is True
+    assert sh.should_trigger([], False, None, _NOW)[0] is False
 
 
 def test_challenge_uses_the_competition_metric_per_station() -> None:

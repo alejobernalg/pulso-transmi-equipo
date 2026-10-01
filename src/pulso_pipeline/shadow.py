@@ -1,9 +1,10 @@
 """Reentrenamiento automático con evaluación en sombra.
 
 1. Disparador (`python -m pulso_pipeline.shadow`, después de cada corrida de
-   predicción): guarda una foto del leaderboard y, si nuestro puesto en
-   `rolling_24h` está `RANK_GAP` o más por debajo del puesto acumulado,
-   dispara `train.yml` en modo sombra.
+   predicción): guarda una foto del leaderboard y dispara `train.yml` en modo
+   sombra si (a) nuestro puesto en `rolling_24h` está `RANK_GAP` o más por
+   debajo del acumulado, o (b) los últimos `ACC_DROP_CYCLES` ciclos calificados
+   quedaron más de `ACC_DROP` puntos bajo la validación del champion.
 2. Sombra: el modelo nuevo predice cada ciclo junto al champion, pero no se
    envía (`shadow_predictions`).
 3. Decisión (al inicio de cada corrida de predicción): con `SHADOW_CYCLES`
@@ -28,23 +29,38 @@ from pulso_forecast import forecast_for_targets
 from . import db
 
 RANK_GAP = 3            # puestos por debajo (24 h vs acumulado) que disparan el reentrenamiento
+ACC_DROP = 10.0         # puntos bajo la validación del champion...
+ACC_DROP_CYCLES = 3     # ...en cada uno de los últimos N ciclos calificados
 SHADOW_CYCLES = 4       # ciclos observados para decidir
 TRIGGER_COOLDOWN = timedelta(hours=2)
 
 
 # ------------------------------------------------------------ decisiones puras
-def should_trigger(rank_cumulative: int | None, rank_rolling: int | None, shadow_pending: bool,
-                   last_trigger_at: datetime | None, now: datetime) -> tuple[bool, str]:
-    if rank_cumulative is None or rank_rolling is None:
-        return False, "sin posición en el leaderboard"
-    gap = rank_rolling - rank_cumulative
-    if gap < RANK_GAP:
-        return False, f"24 h #{rank_rolling} vs acumulado #{rank_cumulative} (brecha {gap} < {RANK_GAP})"
+def drift_reasons(rank_cumulative: int | None, rank_rolling: int | None,
+                  cycle_accs: list[float], baseline: float | None) -> list[str]:
+    """Motivos para reentrenar: caída en el ranking reciente, o accuracy en vivo muy por
+    debajo de lo normal (el drift que golpea a todos por igual no mueve el ranking)."""
+    reasons = []
+    if rank_cumulative is not None and rank_rolling is not None and rank_rolling - rank_cumulative >= RANK_GAP:
+        reasons.append(f"24 h #{rank_rolling} vs acumulado #{rank_cumulative} "
+                       f"(brecha {rank_rolling - rank_cumulative})")
+    if (baseline is not None and len(cycle_accs) >= ACC_DROP_CYCLES
+            and all(a < baseline - ACC_DROP for a in cycle_accs[:ACC_DROP_CYCLES])):
+        accs = ", ".join(f"{a:.1f}" for a in cycle_accs[:ACC_DROP_CYCLES])
+        reasons.append(f"últimos {ACC_DROP_CYCLES} ciclos {accs} < validación {baseline:.1f} - {ACC_DROP:g}")
+    return reasons
+
+
+def should_trigger(reasons: list[str], shadow_pending: bool, last_trigger_at: datetime | None,
+                   now: datetime) -> tuple[bool, str]:
+    if not reasons:
+        return False, "sin drift: ranking y accuracy reciente dentro de lo normal"
+    why = "; ".join(reasons)
     if shadow_pending:
-        return False, f"brecha {gap}, pero ya hay un modelo en sombra"
+        return False, f"{why}, pero ya hay un modelo en sombra"
     if last_trigger_at is not None and now - last_trigger_at < TRIGGER_COOLDOWN:
-        return False, f"brecha {gap}, pero se disparó hace menos de {TRIGGER_COOLDOWN}"
-    return True, f"24 h #{rank_rolling} vs acumulado #{rank_cumulative} (brecha {gap})"
+        return False, f"{why}, pero se disparó hace menos de {TRIGGER_COOLDOWN}"
+    return True, why
 
 
 def challenge_accuracy(frame: pd.DataFrame) -> tuple[float, float]:
@@ -151,6 +167,41 @@ def dispatch_training() -> None:
     r.raise_for_status()
 
 
+def recent_cycle_accuracies(database, n: int = ACC_DROP_CYCLES, lookback: int = 8) -> list[float]:
+    """Accuracy (métrica del reto) de los últimos `n` ciclos entregados y ya observados por
+    completo, del más reciente al más antiguo."""
+    receipts = (database.table("submission_receipts").select("cycle_id,model_id").eq("status", "accepted")
+                .order("accepted_at", desc=True).limit(lookback).execute().data)
+    if not receipts:
+        return []
+    preds = pd.DataFrame(database.table("predictions").select("cycle_id,model_id,station_id,target_at,y_pred")
+                         .in_("cycle_id", [r["cycle_id"] for r in receipts]).execute().data)
+    if preds.empty:
+        return []
+    sent = {(r["cycle_id"], r["model_id"]) for r in receipts}
+    preds = preds[[(c, m) in sent for c, m in zip(preds["cycle_id"], preds["model_id"])]].copy()
+    preds["station_id"] = preds["station_id"].str.strip()
+    preds["target_at"] = pd.to_datetime(preds["target_at"], utc=True)
+    obs = pd.DataFrame(database.table("observations").select("station_id,observed_at,demand")
+                       .in_("observed_at", sorted({t.isoformat() for t in preds["target_at"]})).execute().data)
+    if obs.empty:
+        return []
+    obs["station_id"] = obs["station_id"].str.strip()
+    obs["observed_at"] = pd.to_datetime(obs["observed_at"], utc=True)
+    m = preds.merge(obs, left_on=["station_id", "target_at"], right_on=["station_id", "observed_at"])
+    accs = []
+    for r in receipts:  # en orden: del más reciente al más antiguo
+        g = m[m["cycle_id"] == r["cycle_id"]]
+        if g.empty or len(g) < (preds["cycle_id"] == r["cycle_id"]).sum():
+            continue  # todavía no está observado por completo
+        err = (g["demand"] - g["y_pred"]).abs().groupby(g["station_id"]).sum()
+        tot = g["demand"].groupby(g["station_id"]).sum()
+        accs.append(float((100 * (1 - err / tot)).clip(lower=0).mean()))
+        if len(accs) == n:
+            break
+    return accs
+
+
 def main() -> int:
     from pulso_transmi import PulsoTransmiClient
 
@@ -161,9 +212,12 @@ def main() -> int:
         clock = client.clock()
     rank_c, acc_c = _my_rank(cumulative, name)
     rank_r, acc_r = _my_rank(rolling, name)
+    champion = db.get_active_model(database)
+    baseline = db.validation_accuracy(database, champion["model_id"]) if champion else None
+    reasons = drift_reasons(rank_c, rank_r, recent_cycle_accuracies(database), baseline)
     last = db.last_retrain_trigger_at(database)
     now = datetime.now(timezone.utc)
-    trigger, reason = should_trigger(rank_c, rank_r, db.get_shadow_model(database) is not None,
+    trigger, reason = should_trigger(reasons, db.get_shadow_model(database) is not None,
                                      datetime.fromisoformat(last) if last else None, now)
     if trigger:
         dispatch_training()
