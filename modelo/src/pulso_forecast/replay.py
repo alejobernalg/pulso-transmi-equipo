@@ -107,10 +107,14 @@ def common_factors(resid: pd.DataFrame) -> pd.Series:
 
 
 def apply_production(preds: pd.DataFrame, resid: pd.DataFrame) -> pd.DataFrame:
-    """Réplica completa de `forecast_for_targets`: corrección por estación x factor común."""
+    """Réplica completa de `forecast_for_targets`: corrección por estación x factor común x nowcast."""
     out = apply_rule(preds, resid, production_rule).join(common_factors(resid), on=["origin", "h"])
     out["factor"] = out["factor"] * out["common"].fillna(1.0)
-    out["pred"] = out["base"] * out["factor"]
+    x = resid[(resid["h"] == 1) & (resid["age"] <= M.NOWCAST_WINDOW)].groupby(["origin", "station_id"])[["y", "p"]].sum()
+    now = (x["y"] / x["p"].where(x["p"] > 0)).clip(*M.NOWCAST_CLIP).rename("now")
+    out = out.join(now, on=["origin", "station_id"])
+    expo = out["h"].map(M.NOWCAST_DECAY).fillna(0.0) * M.NOWCAST_STRENGTH
+    out["pred"] = out["base"] * out["factor"] * (out["now"] / out["factor"]).pow(expo).fillna(1.0)
     return out
 
 

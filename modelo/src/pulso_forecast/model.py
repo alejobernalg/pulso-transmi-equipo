@@ -651,6 +651,37 @@ def recent_bias_factors(model, frame: pd.DataFrame, h: int, last_t: int, train_e
     return own * common
 
 
+# Nowcast por estación: durante las oleadas del 18-sep cada ráfaga duraba ~45 min en una
+# estación (autocorrelación del exceso: 0.88 a 15 min, 0.64 a 30, ~0 a 60). La razón
+# real/predicho de la última media hora a +15 min anticipa los horizontes cortos; se aplica
+# sobre la corrección vigente, a media fuerza y con peso que decae hasta 0 a +60 min.
+# Replay: +1.66 en la ventana de las oleadas, +0.05 / -0.01 en las ventanas 11..18-sep.
+NOWCAST_WINDOW = 2
+NOWCAST_STRENGTH = 0.5
+NOWCAST_DECAY = {1: 0.88, 2: 0.64, 3: 0.3, 4: 0.0}
+NOWCAST_CLIP = (0.33, 3.0)
+
+
+def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
+                   train_end_t: int | None) -> pd.Series:
+    """Razón real/predicho (modelo +15 min) de los últimos `NOWCAST_WINDOW` objetivos ya
+    observados, por estación (índice = posición de la estación). Solo usa datos <= origen."""
+    last_t = len(y) - 1
+    ext_idx = y.index.append(pd.date_range(y.index[-1] + pd.Timedelta(minutes=STEP_MIN), periods=1,
+                                           freq=f"{STEP_MIN}min"))
+    frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, 1)
+    tgt = frame["_t"] + 1
+    ok = (tgt <= last_t) & (tgt > last_t - NOWCAST_WINDOW) & frame["_y"].notna() & frame["_scale"].notna()
+    if train_end_t is not None:
+        ok &= tgt > train_end_t
+    past = frame[ok]
+    if past.empty:
+        return pd.Series(dtype=float)
+    g = pd.DataFrame({"station": past["station"].astype(int).to_numpy(), "y": past["_y"].to_numpy(),
+                      "p": predict(models[1], past)}).groupby("station")[["y", "p"]].sum()
+    return (g["y"] / g["p"].where(g["p"] > 0)).clip(*NOWCAST_CLIP).dropna()
+
+
 def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: pd.DataFrame,
                           origin, targets, train_cutoff=None) -> pd.DataFrame:
     """Predice exactamente los pares (station_id, target_at) que pide un ciclo.
@@ -679,17 +710,23 @@ def forecast_for_targets(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stati
 
     by_h = pd.Series([h for _, _, h in parsed]).unique()
     preds_by_h: dict[int, pd.Series] = {}
+    train_end_t = None
+    if train_cutoff is not None:
+        train_end_t = int(y.index.searchsorted(pd.Timestamp(train_cutoff), side="right")) - 1
+    now = nowcast_ratios(models, y, ctx, stations, train_end_t) if 1 in models else pd.Series(dtype=float)
     for h in by_h:
         ext_idx = y.index.append(pd.date_range(origin + pd.Timedelta(minutes=STEP_MIN), periods=h,
                                                freq=f"{STEP_MIN}min"))
         frame = make_frame(y.reindex(ext_idx), ctx.reindex(ext_idx), stations, h)
         cur = frame[frame["_t"] == len(y) - 1]
         pred = predict(models[h], cur)
-        train_end_t = None
-        if train_cutoff is not None:
-            train_end_t = int(y.index.searchsorted(pd.Timestamp(train_cutoff), side="right")) - 1
         factors = recent_bias_factors(models[h], frame, h, len(y) - 1, train_end_t)
-        pred = pred * cur["station"].astype(int).map(factors).fillna(1.0).to_numpy()
+        st_idx = cur["station"].astype(int)
+        f = st_idx.map(factors).fillna(1.0).to_numpy()
+        n = st_idx.map(now).to_numpy(dtype=float)
+        expo = NOWCAST_STRENGTH * NOWCAST_DECAY.get(int(h), 0.0)
+        adj = np.where(np.isnan(n), 1.0, (n / f) ** expo)
+        pred = pred * f * adj
         station_ids = stations.index[cur["station"].astype(int)]
         preds_by_h[h] = pd.Series(pred, index=station_ids)
 
