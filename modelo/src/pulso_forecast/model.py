@@ -760,7 +760,12 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 #     16 desde las 10 h del 18-sep sin saberlo de antemano y no cambia nada en días normales;
 #   - "adaptativo" / "adaptativo6h": Extra Trees reentrenado en cada ciclo con las últimas 12 h
 #     (`ONLINE_WINDOW`) o 6 h y solo rezagos recientes, así aprende cualquier forma nueva en
-#     horas. El de 6 h se recupera antes tras un cambio (18-sep 10-11 h: 86-91 vs 71-72).
+#     horas. El de 6 h se recupera antes tras un cambio (18-sep 10-11 h: 86-91 vs 71-72);
+#   - "plantilla" / "plantillaxK": las 12 estaciones repiten la misma onda de 4 h, solo
+#     desfasada (0/4/8/12 cuartos) y escalada por su nivel. Se estima una forma común con
+#     las últimas K oscilaciones de todas las estaciones alineadas, y cada una la usa con su
+#     fase y su nivel: 12 veces más datos que su propia historia. Replay del 18-19 sep:
+#     régimen maduro 93.13 vs 92.59, y con una sola oscilación ya da 93.8 a las 10 h del 18.
 # El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
 CYCLE_PERIOD = 16
 CYCLE_MAX_PERIODS = 6
@@ -825,6 +830,19 @@ def adaptive_forecast(Y: np.ndarray, origin_t: int, horizons, window: int = ONLI
     return out
 
 
+def template_forecast(Y: np.ndarray, origin_t: int, horizons, k: int, period: int = CYCLE_PERIOD) -> dict[int, np.ndarray]:
+    """{h: predicción por estación} con la forma de onda común a todas las estaciones."""
+    prof = np.nanmean(Y[origin_t - period * k + 1:origin_t + 1].reshape(k, period, -1), axis=0)
+    level = prof.mean(axis=0)
+    shape = prof / np.where(level > 0, level, np.nan)
+    ref = shape[:, np.nanargmax(level)]  # la estación más grande, la menos ruidosa
+    shifts = [min(range(period), key=lambda s: np.nansum(np.abs(np.roll(shape[:, j], -s) - ref)))
+              for j in range(shape.shape[1])]
+    common = np.nanmean([np.roll(shape[:, j], -s) for j, s in enumerate(shifts)], axis=0)
+    # la posición h-1 de la ventana es la fase del objetivo t+h (la ventana termina en t)
+    return {h: np.array([common[(h - 1 - s) % period] for s in shifts]) * level for h in horizons}
+
+
 def _champion_components(models, y, ctx, stations, horizons, train_end_t, policy) -> dict[int, pd.DataFrame]:
     """Predicción del champion (con corrección online) desde el último índice de `y`."""
     origin = y.index[-1]
@@ -858,6 +876,8 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
         period = CYCLE_PERIOD if name.startswith("ciclica16") else detect_period(Y, origin_t)
         k = int(name.split("x")[1]) if "x" in name else 1
         return {h: np.mean([Y[origin_t + h - period * j] for j in range(1, k + 1)], axis=0) for h in horizons}
+    if name.startswith("plantilla"):
+        return template_forecast(Y, origin_t, horizons, int(name.split("x")[1]) if "x" in name else 1)
     if name == "adaptativo6h":
         return adaptive_forecast(Y, origin_t, horizons, window=ONLINE_FAST_WINDOW)
     return adaptive_forecast(Y, origin_t, horizons)
@@ -865,7 +885,8 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
 
 EXPERTS = ("champion", "adaptativo", "adaptativo6h",
            "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
-           "periodica", *(f"periodicax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
+           "periodica", *(f"periodicax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
+           "plantilla", *(f"plantillax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
 
 
 def select_expert(models, y, ctx, stations, Y: np.ndarray, train_end_t, policy) -> tuple[str, str, dict]:
