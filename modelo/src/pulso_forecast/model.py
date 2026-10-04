@@ -62,6 +62,11 @@ def raw_wide_from_frames(obs: pd.DataFrame, ctx: pd.DataFrame, stations: pd.Data
         frame["observed_at"] = pd.to_datetime(frame["observed_at"], utc=True)
     y = obs.pivot(index="observed_at", columns="station_id", values="demand").sort_index().astype(float)
     ctx = ctx.set_index("observed_at").sort_index()
+    # El stream v2 marca algunos periodos como `missing` (sin valor): se completa la
+    # grilla y se interpola cada hueco con sus vecinos ya observados. Al final de la
+    # serie solo hay pasado, así que se arrastra el último valor (sin mirar el futuro).
+    y = y.reindex(pd.date_range(y.index[0], y.index[-1], freq=f"{STEP_MIN}min", name=y.index.name))
+    y = y.interpolate(method="time", limit_area="inside").ffill().bfill()
     steps = y.index.to_series().diff().dropna().unique()
     assert len(steps) == 1 and steps[0] == pd.Timedelta(minutes=STEP_MIN), "la serie debe ser regular"
     orphan_ctx = ctx.index.difference(y.index)

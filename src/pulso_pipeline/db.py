@@ -77,10 +77,29 @@ def set_cursor(db: Client, resource: str, cursor: str | None) -> None:
 
 
 # --------------------------------------------------------------- datos crudos
+def observation_demand(row: dict) -> int | None:
+    """Demanda de una fila del stream en cualquiera de sus esquemas.
+
+    v1 trae `demand` plano; v2 (desde 2026-10-03) trae `measurement.value` como
+    texto ("546.00") y `quality`. Las filas `missing` llegan con `value` nulo: se
+    omiten y `raw_wide_from_frames` interpola el hueco.
+    """
+    if "demand" in row:
+        return None if row["demand"] is None else int(round(float(row["demand"])))
+    value = (row.get("measurement") or {}).get("value")
+    return None if value is None else int(round(float(value)))
+
+
 def upsert_observations(db: Client, rows: list[dict]) -> None:
     if not rows:
         return
-    payload = [{"observed_at": r["observed_at"], "station_id": r["station_id"], "demand": r["demand"]} for r in rows]
+    payload = []
+    for r in rows:
+        demand = observation_demand(r)
+        if demand is not None:
+            payload.append({"observed_at": r["observed_at"], "station_id": r["station_id"], "demand": demand})
+    if not payload:
+        return
     db.table("observations").upsert(payload, on_conflict="observed_at,station_id").execute()
 
 
