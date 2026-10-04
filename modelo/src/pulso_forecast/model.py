@@ -771,7 +771,13 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 #     las últimas K oscilaciones de todas las estaciones alineadas, y cada una la usa con su
 #     fase y su nivel: 12 veces más datos que su propia historia. Replay del 18-19 sep:
 #     régimen maduro 93.13 vs 92.59, y con una sola oscilación ya da 93.8 a las 10 h del 18.
+#   - "persistencia" / "tendencia": el último valor, o el último valor más la mitad de la
+#     pendiente de los últimos 30 min. El 20-sep 12 h UTC el régimen cíclico de 4 h se
+#     deshizo en ondas lentas sin periodo estable: todos los expertos anteriores cayeron a
+#     ~57 y estos dieron 74 / 77.5 en las 5 h siguientes (en régimen cíclico: 51 / 59, ahí
+#     no ganan y el selector no los elige).
 # El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
+TREND_DAMPING = 0.5
 CYCLE_PERIOD = 16
 CYCLE_MAX_PERIODS = 6
 ONLINE_WINDOW = 48                 # 12 h de orígenes de entrenamiento
@@ -881,6 +887,11 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
         period = CYCLE_PERIOD if name.startswith("ciclica16") else detect_period(Y, origin_t)
         k = int(name.split("x")[1]) if "x" in name else 1
         return {h: np.mean([Y[origin_t + h - period * j] for j in range(1, k + 1)], axis=0) for h in horizons}
+    if name == "persistencia":
+        return {h: Y[origin_t].copy() for h in horizons}
+    if name == "tendencia":
+        slope = (Y[origin_t] - Y[origin_t - 2]) / 2
+        return {h: np.clip(Y[origin_t] + TREND_DAMPING * h * slope, 0, None) for h in horizons}
     if name.startswith("plantilla"):
         return template_forecast(Y, origin_t, horizons, int(name.split("x")[1]) if "x" in name else 1)
     if name == "adaptativo6h":
@@ -888,7 +899,7 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
     return adaptive_forecast(Y, origin_t, horizons)
 
 
-EXPERTS = ("champion", "adaptativo", "adaptativo6h",
+EXPERTS = ("champion", "adaptativo", "adaptativo6h", "persistencia", "tendencia",
            "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
            "periodica", *(f"periodicax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
            "plantilla", *(f"plantillax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
