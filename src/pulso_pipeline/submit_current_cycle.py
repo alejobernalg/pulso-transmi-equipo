@@ -192,7 +192,10 @@ def wait_for_cutoff(client: PulsoTransmiClient, database, cutoff: str) -> None:
             return  # forecast_for_targets falla con un mensaje claro; la siguiente corrida reintenta
         print(f"esperando observaciones hasta {cutoff} (último dato {latest})")
         time.sleep(CUTOFF_POLL_SECONDS)
-        sync_observations(client, database)
+        try:
+            sync_observations(client, database)
+        except Exception as exc:  # noqa: BLE001 - el siguiente sondeo reintenta
+            print(f"aviso: el sync falló esperando el cutoff ({exc})")
 
 
 def _wait_for_cycle(client: PulsoTransmiClient):
@@ -217,9 +220,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with PulsoTransmiClient() as client:
-            n_obs = sync_observations(client, database)
-            n_ctx = sync_context(client, database)
-            print(f"sync: {n_obs} observaciones, {n_ctx} periodos de contexto")
+            # Un cambio de formato en la API (pasó el 2026-10-03: schema v2) no debe dejar
+            # el ciclo sin enviar: si el sync falla se predice con lo que ya hay en Supabase.
+            try:
+                n_obs = sync_observations(client, database)
+                n_ctx = sync_context(client, database)
+                print(f"sync: {n_obs} observaciones, {n_ctx} periodos de contexto")
+            except Exception as exc:  # noqa: BLE001
+                print(f"aviso: el sync falló ({type(exc).__name__}: {exc}); se sigue con los datos guardados")
             check_context_freshness(database, run_id)
 
             cycle = _wait_for_cycle(client)

@@ -95,7 +95,11 @@ def upsert_observations(db: Client, rows: list[dict]) -> None:
         return
     payload = []
     for r in rows:
-        demand = observation_demand(r)
+        try:
+            demand = observation_demand(r)
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"aviso: fila de observación ilegible, se omite ({exc}): {r}")
+            continue
         if demand is not None:
             payload.append({"observed_at": r["observed_at"], "station_id": r["station_id"], "demand": demand})
     if not payload:
