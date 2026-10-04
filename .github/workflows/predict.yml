@@ -16,7 +16,7 @@ concurrency:
 jobs:
   predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15  # esperas de ciclo (3 min) + cutoff (4 min) + instalación + respaldo
     permissions:
       contents: read
       actions: write  # el disparador lanza train.yml en modo sombra
