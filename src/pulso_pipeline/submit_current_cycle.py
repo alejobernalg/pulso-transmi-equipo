@@ -26,7 +26,7 @@ from pulso_forecast.model import raw_wide_from_frames
 from pulso_forecast.model import DEFAULT_POLICY_NAME, POLICIES
 from pulso_transmi import PulsoTransmiApiError, PulsoTransmiClient, PulsoTransmiError
 
-from . import db, policy, shadow
+from . import db, fallback, policy, shadow
 
 STEP_MIN = 15
 RETRYABLE_MAX_ATTEMPTS = 3
@@ -209,7 +209,29 @@ def _wait_for_cycle(client: PulsoTransmiClient):
     return cycle
 
 
+_submitted = False  # el camino normal ya entregó en esta corrida: el respaldo no debe pisarlo
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Camino normal y, si falla antes de entregar, envío de emergencia (`fallback`)."""
+    try:
+        return _main(argv)
+    except Exception as exc:  # noqa: BLE001
+        if _submitted or (argv and "--dry-run" in argv) or "--dry-run" in sys.argv:
+            raise
+        print(f"ERROR en el camino normal: {type(exc).__name__}: {exc}")
+        try:
+            sent = fallback.emergency_submit(f"{type(exc).__name__}: {exc}")
+        except Exception as fb_exc:  # noqa: BLE001
+            print(f"el respaldo también falló: {type(fb_exc).__name__}: {fb_exc}")
+            raise exc from fb_exc
+        if not sent:
+            raise
+        return 0
+
+
+def _main(argv: list[str] | None = None) -> int:
+    global _submitted
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="arma y valida el batch, no lo envía")
     args = parser.parse_args(argv)
@@ -343,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
                     time.sleep(2 ** attempt)
             if receipt is None:
                 raise last_error or RuntimeError("no se pudo enviar la submission")
+            _submitted = True
 
             now = datetime.now(timezone.utc).isoformat()
             db.save_receipt(

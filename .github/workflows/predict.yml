@@ -20,6 +20,7 @@ jobs:
     permissions:
       contents: read
       actions: write  # el disparador lanza train.yml en modo sombra
+      issues: write   # alerta cuando una corrida falla o entrega con el respaldo
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +38,23 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python -m pulso_pipeline.submit_current_cycle
+
+      - name: Alerta (fallo o envío de respaldo)
+        if: failure() || hashFiles('degraded.txt') != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DETAIL="$(cat degraded.txt 2>/dev/null || echo 'la corrida falló')"
+          OPEN=$(gh issue list --label pipeline-alert --state open --json number -q '.[0].number')
+          if [ -n "$OPEN" ]; then
+            gh issue comment "$OPEN" --body "$DETAIL — $RUN_URL"
+          else
+            gh label create pipeline-alert --color B60205 --force >/dev/null 2>&1 || true
+            gh issue create --label pipeline-alert --title "Pipeline de predicción en riesgo" \
+              --body "$DETAIL — $RUN_URL" --assignee "${{ github.repository_owner }}"
+          fi
 
       - name: Leaderboard y reentrenamiento automático
         if: always()
