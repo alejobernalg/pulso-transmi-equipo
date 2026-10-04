@@ -776,6 +776,13 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 #     deshizo en ondas lentas sin periodo estable: todos los expertos anteriores cayeron a
 #     ~57 y estos dieron 74 / 77.5 en las 5 h siguientes (en régimen cíclico: 51 / 59, ahí
 #     no ganan y el selector no los elige).
+#   - "armonica" / "onda": el 20-sep 12 h UTC (revisión 4) la onda pasó a durar 8 h (periodo
+#     32) con más ruido y huecos en la fuente. Copiar la oscilación anterior ("periodica")
+#     arrastra todo su ruido; "armonica" ajusta por estación una onda suave (3 armónicos del
+#     periodo detectado, en log, sobre el último periodo y medio) y "onda" promedia esa, la
+#     misma en escala lineal y la plantilla común. Replay 21-sep 01-06 h UTC: periodica 90.1,
+#     adaptativo6h 89.4, plantilla 91.8, armonica 91.9, onda 92.4. La plantilla usa ahora el
+#     periodo detectado (antes fijo en 16: en este régimen daba ~55 y no competía).
 # El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
 TREND_DAMPING = 0.5
 CYCLE_PERIOD = 16
@@ -792,6 +799,8 @@ ONLINE_FAST_WINDOW = 24
 EXPERT_MARGIN = 3.0
 PERIOD_RANGE = range(8, 49)        # 2 h a 12 h
 PERIOD_WINDOW = 16                 # objetivos recientes con los que se elige el periodo
+HARMONICS = 3                      # armónicos del periodo en la onda suave
+HARMONIC_SPAN = 1.5                # periodos de historia con los que se ajusta
 
 
 def _wape_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -854,6 +863,23 @@ def template_forecast(Y: np.ndarray, origin_t: int, horizons, k: int, period: in
     return {h: np.array([common[(h - 1 - s) % period] for s in shifts]) * level for h in horizons}
 
 
+def harmonic_forecast(Y: np.ndarray, origin_t: int, horizons, period: int, log: bool = True) -> dict[int, np.ndarray]:
+    """{h: predicción por estación} con una onda suave de periodo `period` ajustada por
+    mínimos cuadrados a los últimos `HARMONIC_SPAN` periodos (solo Y[<= origen])."""
+    def basis(t):
+        w = 2 * np.pi * np.asarray(t, dtype=float) / period
+        return np.stack([np.ones(len(w))] + [f(k * w) for k in range(1, HARMONICS + 1) for f in (np.sin, np.cos)], axis=1)
+
+    t = np.arange(origin_t - int(HARMONIC_SPAN * period) + 1, origin_t + 1)
+    Z = np.log1p(Y[t]) if log else Y[t]
+    coef, *_ = np.linalg.lstsq(basis(t), Z, rcond=None)
+    out = {}
+    for h in horizons:
+        v = (basis([origin_t + h]) @ coef)[0]
+        out[h] = np.clip(np.expm1(v) if log else v, 0, None)
+    return out
+
+
 def _champion_components(models, y, ctx, stations, horizons, train_end_t, policy) -> dict[int, pd.DataFrame]:
     """Predicción del champion (con corrección online) desde el último índice de `y`."""
     origin = y.index[-1]
@@ -893,13 +919,21 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
         slope = (Y[origin_t] - Y[origin_t - 2]) / 2
         return {h: np.clip(Y[origin_t] + TREND_DAMPING * h * slope, 0, None) for h in horizons}
     if name.startswith("plantilla"):
-        return template_forecast(Y, origin_t, horizons, int(name.split("x")[1]) if "x" in name else 1)
+        return template_forecast(Y, origin_t, horizons, int(name.split("x")[1]) if "x" in name else 1,
+                                 period=detect_period(Y, origin_t))
+    if name == "armonica":
+        return harmonic_forecast(Y, origin_t, horizons, detect_period(Y, origin_t))
+    if name == "onda":
+        period = detect_period(Y, origin_t)
+        parts = [harmonic_forecast(Y, origin_t, horizons, period), harmonic_forecast(Y, origin_t, horizons, period, log=False),
+                 template_forecast(Y, origin_t, horizons, 1, period=period)]
+        return {h: np.mean([p[h] for p in parts], axis=0) for h in horizons}
     if name == "adaptativo6h":
         return adaptive_forecast(Y, origin_t, horizons, window=ONLINE_FAST_WINDOW)
     return adaptive_forecast(Y, origin_t, horizons)
 
 
-EXPERTS = ("champion", "adaptativo", "adaptativo6h", "persistencia", "tendencia",
+EXPERTS = ("champion", "adaptativo", "adaptativo6h", "persistencia", "tendencia", "armonica", "onda",
            "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
            "periodica", *(f"periodicax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
            "plantilla", *(f"plantillax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
