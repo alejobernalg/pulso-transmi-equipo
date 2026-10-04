@@ -783,6 +783,13 @@ def nowcast_ratios(models: dict, y: pd.DataFrame, ctx: pd.DataFrame, stations: p
 #     misma en escala lineal y la plantilla común. Replay 21-sep 01-06 h UTC: periodica 90.1,
 #     adaptativo6h 89.4, plantilla 91.8, armonica 91.9, onda 92.4. La plantilla usa ahora el
 #     periodo detectado (antes fijo en 16: en este régimen daba ~55 y no competía).
+#   - "comun": el ruido de este régimen es blanco e independiente entre estaciones (~8 %,
+#     techo ~93.3), así que solo queda bajar el error de estimación. Las 12 estaciones
+#     comparten la forma de la onda (misma amplitud relativa, distinta fase) y su nivel
+#     deriva despacio (~1 % cada 2 h). `common_wave_forecast` ajusta una sola forma con todas
+#     las estaciones y, por estación, fase, nivel y tendencia, usando tantos periodos como
+#     el régimen permita (`COMMON_SPANS`). Replay 21-sep 01-08:30 h UTC (31 orígenes):
+#     92.9 vs 92.4 de "onda", mejor en el 80 % de los orígenes y en ambas mitades.
 # El champion se abandona solo si otro le gana por más de `EXPERT_MARGIN` puntos.
 TREND_DAMPING = 0.5
 CYCLE_PERIOD = 16
@@ -801,6 +808,9 @@ PERIOD_RANGE = range(8, 49)        # 2 h a 12 h
 PERIOD_WINDOW = 16                 # objetivos recientes con los que se elige el periodo
 HARMONICS = 3                      # armónicos del periodo en la onda suave
 HARMONIC_SPAN = 1.5                # periodos de historia con los que se ajusta
+COMMON_HARMONICS = 4               # armónicos de la forma común a todas las estaciones
+COMMON_SPANS = (1.5, 2.0, 2.5, 3.0)  # periodos de historia candidatos, del más corto al más largo
+COMMON_SPAN_TOL = 1.15             # una ventana más larga se acepta si su residuo no crece más que esto
 
 
 def _wape_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -880,6 +890,53 @@ def harmonic_forecast(Y: np.ndarray, origin_t: int, horizons, period: int, log: 
     return out
 
 
+def _common_wave_fit(Y: np.ndarray, origin_t: int, horizons, period: int, span: float):
+    """Ajuste log y_j(t) = nivel_j + tendencia_j * (t - origen) + forma(2*pi*t/periodo + fase_j)
+    sobre los últimos `span` periodos. Devuelve ({h: predicción por estación}, rmse del residuo)."""
+    def shape_basis(theta):
+        return np.stack([f(k * theta) for k in range(1, COMMON_HARMONICS + 1) for f in (np.sin, np.cos)], axis=-1)
+
+    t = np.arange(origin_t - int(round(span * period)) + 1, origin_t + 1)
+    Z = np.log1p(Y[t])
+    w = 2 * np.pi / period
+    L = np.c_[np.ones(len(t)), (t - origin_t) / period]
+    first, *_ = np.linalg.lstsq(np.c_[L, np.sin(w * t), np.cos(w * t)], Z, rcond=None)
+    phase = np.arctan2(first[3], first[2])  # fase inicial: primer armónico de cada estación
+    level = L @ first[:2]
+    grid = np.linspace(-np.pi / 8, np.pi / 8, 33)
+    for _ in range(3):  # forma común -> fase por estación contra esa forma -> nivel y tendencia
+        theta = w * t[:, None] + phase[None, :]
+        coef, *_ = np.linalg.lstsq(shape_basis(theta).reshape(-1, 2 * COMMON_HARMONICS), (Z - level).reshape(-1),
+                                   rcond=None)
+        sse = np.stack([((Z - level - shape_basis(theta + g) @ coef) ** 2).sum(axis=0) for g in grid])
+        phase = phase + grid[sse.argmin(axis=0)]
+        theta = w * t[:, None] + phase[None, :]
+        lev_coef, *_ = np.linalg.lstsq(L, Z - shape_basis(theta) @ coef, rcond=None)
+        level = L @ lev_coef
+    rmse = float(np.sqrt(np.mean((Z - level - shape_basis(theta) @ coef) ** 2)))
+    out = {h: np.clip(np.expm1(lev_coef[0] + lev_coef[1] * h / period + shape_basis(w * (origin_t + h) + phase) @ coef),
+                      0, None) for h in horizons}
+    return out, rmse
+
+
+def common_wave_forecast(Y: np.ndarray, origin_t: int, horizons, period: int) -> dict[int, np.ndarray]:
+    """{h: predicción por estación} con la forma de onda común y nivel con tendencia por
+    estación. Usa la ventana más larga de `COMMON_SPANS` cuyo residuo sigue siendo el de un
+    solo régimen: si la ventana alcanza datos del régimen anterior, el residuo se dispara."""
+    best, base = None, None
+    for span in COMMON_SPANS:
+        if origin_t - int(round(span * period)) + 1 < 0:
+            break
+        out, rmse = _common_wave_fit(Y, origin_t, horizons, period, span)
+        if base is None:
+            best, base = out, rmse
+        elif rmse <= COMMON_SPAN_TOL * base:
+            best = out
+        else:
+            break
+    return best
+
+
 def _champion_components(models, y, ctx, stations, horizons, train_end_t, policy) -> dict[int, pd.DataFrame]:
     """Predicción del champion (con corrección online) desde el último índice de `y`."""
     origin = y.index[-1]
@@ -921,6 +978,8 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
     if name.startswith("plantilla"):
         return template_forecast(Y, origin_t, horizons, int(name.split("x")[1]) if "x" in name else 1,
                                  period=detect_period(Y, origin_t))
+    if name == "comun":
+        return common_wave_forecast(Y, origin_t, horizons, detect_period(Y, origin_t))
     if name == "armonica":
         return harmonic_forecast(Y, origin_t, horizons, detect_period(Y, origin_t))
     if name == "onda":
@@ -933,7 +992,7 @@ def _expert_values(name: str, models, y, ctx, stations, Y: np.ndarray, origin_t:
     return adaptive_forecast(Y, origin_t, horizons)
 
 
-EXPERTS = ("champion", "adaptativo", "adaptativo6h", "persistencia", "tendencia", "armonica", "onda",
+EXPERTS = ("champion", "adaptativo", "adaptativo6h", "persistencia", "tendencia", "armonica", "onda", "comun",
            "ciclica16", *(f"ciclica16x{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
            "periodica", *(f"periodicax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)),
            "plantilla", *(f"plantillax{k}" for k in range(2, CYCLE_MAX_PERIODS + 1)))
